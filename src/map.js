@@ -13,7 +13,18 @@ const START_CLEARANCE = 100; // px kept clear around the player's start
 const CENTRE = { x: (COLS * TILE) / 2, y: (ROWS * TILE) / 2 };
 
 // How tall each kind of piece is. The player can jump over anything lower than a jump.
-export const HEIGHTS = { house: 96, shed: 96, car: 56, lowWall: 36, crate: 40 };
+export const HEIGHTS = {
+  house: 96,
+  shed: 96,
+  wall: 96, // interior wall
+  perimeter: 120, // boundary wall around a map
+  container: 100,
+  bus: 70,
+  car: 56,
+  lowWall: 36,
+  crate: 40,
+  fence: 30,
+};
 
 const times = (count, piece) => Array.from({ length: count }, () => piece);
 
@@ -71,24 +82,30 @@ function makeDoorways(random, piece, count) {
   return sides.map((side) => {
     const horizontal = side === 'top' || side === 'bottom';
     const lengthInTiles = (horizontal ? piece.w : piece.h) / TILE;
-    const offset = (1 + Math.floor(random() * (lengthInTiles - 3))) * TILE;
-    if (side === 'top') return { x: piece.x + offset, y: piece.y, w: 2 * TILE, h: TILE };
-    if (side === 'bottom') return { x: piece.x + offset, y: piece.y + piece.h - TILE, w: 2 * TILE, h: TILE };
-    if (side === 'left') return { x: piece.x, y: piece.y + offset, w: TILE, h: 2 * TILE };
-    return { x: piece.x + piece.w - TILE, y: piece.y + offset, w: TILE, h: 2 * TILE };
+    return doorwayRect(piece, side, 1 + Math.floor(random() * (lengthInTiles - 3)));
   });
 }
 
-// The solid rectangles of a piece: the whole thing, or a building's walls with gaps for doorways.
-function solidParts(piece) {
-  const height = HEIGHTS[piece.kind];
-  if (!piece.doorways) return [{ x: piece.x, y: piece.y, w: piece.w, h: piece.h, height }];
+// A 2-tile doorway in one side of a building, `offset` tiles along from its corner.
+export function doorwayRect(piece, side, offset) {
+  const along = offset * TILE;
+  if (side === 'top') return { x: piece.x + along, y: piece.y, w: 2 * TILE, h: TILE };
+  if (side === 'bottom') return { x: piece.x + along, y: piece.y + piece.h - TILE, w: 2 * TILE, h: TILE };
+  if (side === 'left') return { x: piece.x, y: piece.y + along, w: TILE, h: 2 * TILE };
+  return { x: piece.x + piece.w - TILE, y: piece.y + along, w: TILE, h: 2 * TILE };
+}
+
+// The solid rectangles of a piece: the whole thing, or a building's walls with
+// gaps for doorways. Each carries the piece's kind, height and colour (if any).
+export function solidParts(piece) {
+  const looks = { kind: piece.kind, height: HEIGHTS[piece.kind], ...(piece.colour && { colour: piece.colour }) };
+  if (!piece.doorways) return [{ x: piece.x, y: piece.y, w: piece.w, h: piece.h, ...looks }];
   const { x, y, w, h } = piece;
   const walls = [
-    { x, y, w, h: TILE, height }, // top
-    { x, y: y + h - TILE, w, h: TILE, height }, // bottom
-    { x, y: y + TILE, w: TILE, h: h - 2 * TILE, height }, // left
-    { x: x + w - TILE, y: y + TILE, w: TILE, h: h - 2 * TILE, height }, // right
+    { x, y, w, h: TILE, ...looks }, // top
+    { x, y: y + h - TILE, w, h: TILE, ...looks }, // bottom
+    { x, y: y + TILE, w: TILE, h: h - 2 * TILE, ...looks }, // left
+    { x: x + w - TILE, y: y + TILE, w: TILE, h: h - 2 * TILE, ...looks }, // right
   ];
   return walls.flatMap((wall) => piece.doorways.reduce((parts, door) => parts.flatMap((p) => cut(p, door)), [wall]));
 }
@@ -124,25 +141,30 @@ export function blockedTiles(obstacles) {
 
 // Breadth-first search: the number of tile steps from each open tile to the
 // nearest start tile (Infinity if it can't be reached).
+// Runs every game step, so it uses fixed-size number arrays and no temporary
+// objects: that keeps it fast and avoids garbage-collection stutters.
 export function distancesFrom(starts, blocked) {
-  const distance = new Array(COLS * ROWS).fill(Infinity);
-  const queue = [];
+  const distance = new Float64Array(COLS * ROWS).fill(Infinity);
+  const queue = new Int32Array(COLS * ROWS);
+  let tail = 0;
   for (const i of starts) {
     if (blocked[i] || distance[i] === 0) continue;
     distance[i] = 0;
-    queue.push(i);
+    queue[tail++] = i;
   }
-  for (let head = 0; head < queue.length; head++) {
+  const visit = (n, d) => {
+    if (blocked[n] || distance[n] !== Infinity) return;
+    distance[n] = d;
+    queue[tail++] = n;
+  };
+  for (let head = 0; head < tail; head++) {
     const i = queue[head];
     const c = i % COLS;
-    const r = Math.floor(i / COLS);
-    for (const [nc, nr] of [[c + 1, r], [c - 1, r], [c, r + 1], [c, r - 1]]) {
-      if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS) continue;
-      const n = nr * COLS + nc;
-      if (blocked[n] || distance[n] !== Infinity) continue;
-      distance[n] = distance[i] + 1;
-      queue.push(n);
-    }
+    const d = distance[i] + 1;
+    if (c + 1 < COLS) visit(i + 1, d);
+    if (c > 0) visit(i - 1, d);
+    if (i + COLS < COLS * ROWS) visit(i + COLS, d);
+    if (i >= COLS) visit(i - COLS, d);
   }
   return distance;
 }

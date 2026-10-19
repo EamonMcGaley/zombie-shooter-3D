@@ -3,6 +3,7 @@
 
 import { generateMap, blockedTiles, distancesFrom, TILE, COLS, ROWS, ARENA } from './map.js';
 import { lineEntry, grow } from './geometry.js';
+import { MAPS, buildNamedMap } from './maps.js';
 
 export { ARENA };
 export const PLAYER_SPEED = 200;
@@ -16,6 +17,22 @@ export const JUMP_SPEED = 330; // upward speed at the start of a jump
 export const GRAVITY = 900;
 const MIN_SPAWN_DISTANCE = 10 * TILE; // zombies never appear within 10 tiles of you
 const AIM_ASSIST_CONE = (30 * Math.PI) / 180;
+const DEGREES = Math.PI / 180;
+
+// Each weapon's rules. Spread is the full width of a shotgun's fan; wobble is
+// how far an SMG shot can stray either side; pierce is how many zombies one
+// bullet can kill; range is how far it flies before vanishing; muzzle is how
+// far in front of the player the barrel ends (matching each gun's 3D model).
+export const WEAPONS = {
+  rifle: { fireRate: FIRE_RATE, speed: BULLET_SPEED, pellets: 1, spread: 0, wobble: 0, pierce: 1, range: Infinity, muzzle: 26 },
+  shotgun: { fireRate: 2, speed: 450, pellets: 6, spread: 20 * DEGREES, wobble: 0, pierce: 1, range: 320, muzzle: 28 },
+  smg: { fireRate: 11, speed: 520, pellets: 1, spread: 0, wobble: 4 * DEGREES, pierce: 1, range: Infinity, muzzle: 20 },
+  sniper: { fireRate: 1.8, speed: 1200, pellets: 1, spread: 0, wobble: 0, pierce: 5, range: Infinity, muzzle: 36 },
+};
+
+// The gun is held at this height, a little to the right of the player's centre.
+export const GUN_HEIGHT = 39;
+const GUN_SIDE = 3;
 
 // --- Round rules ---
 
@@ -35,16 +52,31 @@ export function spawnIntervalForRound(round) {
 
 // --- The game ---
 
-// `obstacles` replaces the generated map (tests use [] for an empty arena).
-export function createGame({ random = Math.random, seed, obstacles } = {}) {
+// Options:
+// - map: 'avenue', 'yard', 'bunker', 'random' (one of those three, the
+//   default) or 'generated' (a random layout; passing `seed` also means this).
+// - obstacles: an exact list of obstacles instead of a map (tests use [] for an empty arena).
+// - weapon: 'rifle' (default), 'shotgun', 'smg' or 'sniper'.
+export function createGame({ random = Math.random, seed, obstacles, map, weapon = 'rifle' } = {}) {
   let pieces = [];
+  let mapName = 'Test arena';
   if (obstacles === undefined) {
-    seed ??= Math.floor(Math.random() * 1_000_000);
-    ({ pieces, obstacles } = generateMap(seed));
+    if (seed !== undefined || map === 'generated') {
+      seed ??= Math.floor(Math.random() * 1_000_000);
+      ({ pieces, obstacles } = generateMap(seed));
+      mapName = `Random layout ${seed}`;
+    } else {
+      const names = Object.keys(MAPS);
+      const key = map && map !== 'random' ? map : names[Math.floor(Math.random() * names.length)];
+      ({ name: mapName, pieces, obstacles } = buildNamedMap(key));
+    }
   }
   return {
     random,
     seed: seed ?? null,
+    mapName,
+    weapon,
+    shotsFired: 0,
     pieces,
     obstacles,
     blocked: blockedTiles(obstacles),
@@ -75,10 +107,14 @@ export function step(game, input, dt) {
     startRound(game);
   }
 
+  // Flow field: one search from the player's tile per step, shared by spawning,
+  // every zombie's pathfinding and the stuck check.
+  game.flow = distancesFrom([tileIndex(game.player)], game.blocked);
   spawnZombies(game, dt);
   moveZombies(game, dt);
   pushZombiesApart(game.zombies);
   for (const zombie of game.zombies) pushOutOfObstacles(zombie, game.obstacles);
+  respawnStuckZombies(game, dt);
   shootZombies(game);
 
   if (game.zombies.some((z) => touching(z, game.player))) {
@@ -128,21 +164,45 @@ function jump(player, input, dt) {
 // --- Bullets ---
 
 function fire(game, input, dt) {
-  game.fireCooldown = Math.max(0, game.fireCooldown - dt);
-  if (!input.firing || game.fireCooldown > 1e-9) return;
+  game.fireCooldown -= dt;
+  if (!input.firing) {
+    game.fireCooldown = Math.max(0, game.fireCooldown); // no saving up shots while not firing
+    return;
+  }
+  if (game.fireCooldown > 1e-9) return;
   const { player } = game;
   const dx = input.mouseX - player.x;
   const dy = input.mouseY - player.y;
   if (dx === 0 && dy === 0) return;
-  const angle = Math.atan2(dy, dx) + aimAssistTurn(game, Math.atan2(dy, dx), input.aimAssist ?? 0);
-  game.bullets.push({
-    x: player.x,
-    y: player.y,
-    r: BULLET_RADIUS,
-    vx: Math.cos(angle) * BULLET_SPEED,
-    vy: Math.sin(angle) * BULLET_SPEED,
-  });
-  game.fireCooldown = 1 / FIRE_RATE;
+  const weapon = WEAPONS[game.weapon];
+  // The SMG strays in a fixed wavy pattern (not random), so tests can check it.
+  const wobble = Math.sin(game.shotsFired * 2.4) * weapon.wobble;
+  const aim = Math.atan2(dy, dx) + aimAssistTurn(game, Math.atan2(dy, dx), input.aimAssist ?? 0) + wobble;
+  // Bullets start at the end of the barrel, at gun height, even mid-jump.
+  const facing = Math.atan2(dy, dx);
+  const muzzle = {
+    x: player.x + Math.cos(facing) * weapon.muzzle - Math.sin(facing) * GUN_SIDE,
+    y: player.y + Math.sin(facing) * weapon.muzzle + Math.cos(facing) * GUN_SIDE,
+    z: player.z + GUN_HEIGHT,
+  };
+  for (let i = 0; i < weapon.pellets; i++) {
+    // Pellets are spread evenly across the fan, from one edge to the other.
+    const fan = weapon.pellets === 1 ? 0 : (i / (weapon.pellets - 1) - 0.5) * weapon.spread;
+    game.bullets.push({
+      ...muzzle,
+      r: BULLET_RADIUS,
+      vx: Math.cos(aim + fan) * weapon.speed,
+      vy: Math.sin(aim + fan) * weapon.speed,
+      travelled: 0,
+      range: weapon.range,
+      pierce: weapon.pierce,
+      hits: [],
+    });
+  }
+  game.shotsFired += 1;
+  // Add (not set) so time left over from a 1/60 s step carries to the next
+  // shot. Otherwise fast guns fire slower than their rate.
+  game.fireCooldown += 1 / weapon.fireRate;
 }
 
 // How far (in radians) to turn a shot towards the zombie nearest the aim, if
@@ -169,19 +229,32 @@ function moveBullets(game, dt) {
   for (const bullet of game.bullets) {
     bullet.x += bullet.vx * dt;
     bullet.y += bullet.vy * dt;
+    bullet.travelled += Math.hypot(bullet.vx, bullet.vy) * dt;
   }
   game.bullets = game.bullets.filter(
-    (bullet) => insideArena(bullet) && !game.obstacles.some((o) => overlapDepth(bullet, o) > 0),
+    (bullet) =>
+      bullet.travelled <= bullet.range &&
+      insideArena(bullet) &&
+      // Only obstacles taller than the bullet stop it (no height = infinitely tall).
+      !game.obstacles.some((o) => (o.height ?? Infinity) > bullet.z && overlapDepth(bullet, o) > 0),
   );
 }
 
+// Each bullet kills the zombies it touches until its pierce runs out
+// (1 for most guns, 5 for the sniper), and never hits the same zombie twice.
 function shootZombies(game) {
-  game.zombies = game.zombies.filter((zombie) => {
-    const hit = game.bullets.findIndex((bullet) => touching(bullet, zombie));
-    if (hit === -1) return true;
-    game.bullets.splice(hit, 1);
-    return false;
-  });
+  const dead = new Set();
+  for (const bullet of game.bullets) {
+    for (const zombie of game.zombies) {
+      if (bullet.pierce === 0) break;
+      if (dead.has(zombie) || bullet.hits.includes(zombie) || !touching(bullet, zombie)) continue;
+      dead.add(zombie);
+      bullet.hits.push(zombie);
+      bullet.pierce -= 1;
+    }
+  }
+  game.zombies = game.zombies.filter((zombie) => !dead.has(zombie));
+  game.bullets = game.bullets.filter((bullet) => bullet.pierce > 0);
 }
 
 // --- Zombies ---
@@ -197,27 +270,57 @@ function spawnZombies(game, dt) {
 }
 
 // The centre of a random open tile anywhere on the map, at least 10 tiles from the player.
+// Only tiles the player could walk to count, so zombies never appear somewhere
+// sealed off (like outside Container Yard's walls).
 function spawnPoint(game) {
-  const { random, player, blocked } = game;
+  const { random, player } = game;
+  const steps = game.flow ?? distancesFrom([tileIndex(player)], game.blocked);
+  const centre = (i) => ({ x: ((i % COLS) + 0.5) * TILE, y: (Math.floor(i / COLS) + 0.5) * TILE });
   for (let attempt = 0; attempt < 30; attempt++) {
-    const c = Math.floor(random() * COLS);
-    const r = Math.floor(random() * ROWS);
-    if (blocked[r * COLS + c]) continue;
-    const point = { x: (c + 0.5) * TILE, y: (r + 0.5) * TILE };
+    const i = Math.floor(random() * ROWS) * COLS + Math.floor(random() * COLS);
+    if (steps[i] === Infinity) continue;
+    const point = centre(i);
     if (distance(point, player) >= MIN_SPAWN_DISTANCE) return point;
   }
-  // Unlucky random numbers: use the corner tile furthest from the player (the
-  // map always keeps the edges open).
-  return {
-    x: player.x < ARENA.width / 2 ? ARENA.width - TILE / 2 : TILE / 2,
-    y: player.y < ARENA.height / 2 ? ARENA.height - TILE / 2 : TILE / 2,
-  };
+  // Unlucky random numbers: use the reachable tile furthest from the player.
+  let furthest = tileIndex(player);
+  steps.forEach((d, i) => {
+    if (d !== Infinity && distance(centre(i), player) > distance(centre(furthest), player)) furthest = i;
+  });
+  return centre(furthest);
+}
+
+// Safety net (lots of zombie games do this): a stuck zombie reappears at a new
+// spawn point. Otherwise one stuck zombie would stop the round from ever ending.
+// Stuck means either no path to the player for 2 s, or moving less than 20 px
+// over a whole 5 s window (wedged somewhere).
+const NO_PATH_SECONDS = 2;
+const STUCK_WINDOW = 5;
+const STUCK_DISTANCE = 20;
+
+function respawnStuckZombies(game, dt) {
+  const steps = game.flow;
+  for (const zombie of game.zombies) {
+    zombie.window ??= { x: zombie.x, y: zombie.y, time: 0 };
+    zombie.window.time += dt;
+    zombie.noPathFor = steps[tileIndex(zombie)] === Infinity ? (zombie.noPathFor ?? 0) + dt : 0;
+
+    let stuck = zombie.noPathFor >= NO_PATH_SECONDS;
+    if (zombie.window.time >= STUCK_WINDOW) {
+      stuck ||= distance(zombie, zombie.window) < STUCK_DISTANCE;
+      zombie.window = { x: zombie.x, y: zombie.y, time: 0 };
+    }
+    if (!stuck) continue;
+    Object.assign(zombie, spawnPoint(game));
+    pushOutOfObstacles(zombie, game.obstacles);
+    zombie.window = { x: zombie.x, y: zombie.y, time: 0 };
+    zombie.noPathFor = 0;
+  }
 }
 
 function moveZombies(game, dt) {
   const speed = zombieSpeedForRound(game.round);
-  // Flow field: one search from the player's tile, shared by every zombie.
-  const distance = distancesFrom([tileIndex(game.player)], game.blocked);
+  const distance = game.flow;
   for (const zombie of game.zombies) {
     const target = clearLine(zombie, game.player, game.obstacles)
       ? game.player

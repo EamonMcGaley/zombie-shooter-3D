@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { createGame, step, zombiesInRound, zombieSpeedForRound, spawnIntervalForRound } from '../src/game.js';
 import { generateMap, ARENA } from '../src/map.js';
+import { buildNamedMap } from '../src/maps.js';
 
 const STEP = 1 / 60;
 
@@ -88,8 +89,8 @@ describe('shooting', () => {
   it('sends bullets towards the mouse at 500 px/s', () => {
     let game = step(emptyGame(), input({ ...aimRight, firing: true }), STEP);
     game = run(game, input(aimRight), 29 * STEP);
-    expect(game.bullets[0].x).toBeCloseTo(650);
-    expect(game.bullets[0].y).toBeCloseTo(300);
+    expect(game.bullets[0].x).toBeCloseTo(400 + 26 + 250);
+    expect(game.bullets[0].y).toBeCloseTo(303);
   });
 
   it('fires 5 shots per second while the button is held', () => {
@@ -139,8 +140,8 @@ describe('round rules', () => {
 
 // A game in round 1, past the opening pause, with nothing left to spawn,
 // so a test can place its own zombies.
-function playingGame(zombies, obstacles = []) {
-  const game = emptyGame({ obstacles });
+function playingGame(zombies, obstacles = [], options = {}) {
+  const game = emptyGame({ obstacles, ...options });
   game.phase = 'playing';
   game.zombiesToSpawn = 0;
   game.zombies = zombies.map(([x, y]) => ({ x, y, r: 12 }));
@@ -336,10 +337,97 @@ describe('maps', () => {
     expect(game.obstacles).toEqual(generateMap(5).obstacles);
   });
 
-  it('picks a random map when no seed is given', () => {
-    const game = createGame();
+  it('builds a hand-made map by name', () => {
+    const game = createGame({ map: 'yard' });
+    expect(game.mapName).toBe('Container Yard');
+    expect(game.obstacles).toEqual(buildNamedMap('yard').obstacles);
+  });
+
+  it('picks one of the three hand-made maps for "random" and when nothing is chosen', () => {
+    const names = new Set();
+    for (let i = 0; i < 40; i++) {
+      names.add(createGame({ map: 'random' }).mapName);
+      names.add(createGame().mapName);
+    }
+    expect([...names].sort()).toEqual(['Atomic Avenue', 'Container Yard', 'The Bunker']);
+  });
+
+  it('can still build a generated layout', () => {
+    const game = createGame({ map: 'generated' });
     expect(Number.isInteger(game.seed)).toBe(true);
-    expect(game.obstacles.length).toBeGreaterThan(0);
+    expect(game.mapName).toBe(`Random layout ${game.seed}`);
+  });
+
+  it('only spawns zombies where they can reach the player (inside Container Yard\'s walls)', () => {
+    for (let seed = 1; seed <= 5; seed++) {
+      let game = createGame({ map: 'yard', random: seededRandom(seed) });
+      game = run(game, input(), 3 + 4 * 1.0 + 0.1);
+      expect(game.zombies.length).toBeGreaterThan(2);
+      for (const z of game.zombies) {
+        expect(z.x).toBeGreaterThan(20 * 20);
+        expect(z.x).toBeLessThan(60 * 20);
+        expect(z.y).toBeGreaterThan(15 * 20);
+        expect(z.y).toBeLessThan(45 * 20);
+      }
+    }
+  });
+});
+
+describe('weapons', () => {
+  const aimRight = { mouseX: 700, mouseY: 300 };
+  const angleOf = (bullet) => (Math.atan2(bullet.vy, bullet.vx) * 180) / Math.PI;
+
+  it('uses the rifle unless told otherwise', () => {
+    expect(emptyGame().weapon).toBe('rifle');
+  });
+
+  it('only kills the first of two zombies in a line with the rifle', () => {
+    let game = step(playingGame([[500, 300], [540, 300]]), input({ ...aimRight, firing: true }), STEP);
+    game = run(game, input(aimRight), 0.3);
+    expect(game.zombies).toHaveLength(1);
+  });
+
+  it('fires 6 shotgun pellets fanned across 20 degrees', () => {
+    const game = step(emptyGame({ weapon: 'shotgun' }), input({ ...aimRight, firing: true }), STEP);
+    expect(game.bullets).toHaveLength(6);
+    const angles = game.bullets.map(angleOf);
+    expect(Math.min(...angles)).toBeCloseTo(-10);
+    expect(Math.max(...angles)).toBeCloseTo(10);
+  });
+
+  it('fires the shotgun twice a second', () => {
+    // Count trigger pulls, not pellets: pellets from earlier blasts may have vanished (range).
+    expect(run(emptyGame({ weapon: 'shotgun' }), input({ ...aimRight, firing: true }), 0.4).shotsFired).toBe(1);
+    expect(run(emptyGame({ weapon: 'shotgun' }), input({ ...aimRight, firing: true }), 0.6).shotsFired).toBe(2);
+  });
+
+  it('makes shotgun pellets vanish after a short distance', () => {
+    let game = step(emptyGame({ weapon: 'shotgun' }), input({ ...aimRight, firing: true }), STEP);
+    game = run(game, input(aimRight), 0.4); // 180 px: still flying
+    expect(game.bullets.length).toBeGreaterThan(0);
+    game = run(game, input(aimRight), 0.4); // 360 px: past the 320 px range
+    expect(game.bullets).toEqual([]);
+  });
+
+  it('fires the SMG 11 times a second with a small wobble', () => {
+    const game = run(emptyGame({ weapon: 'smg' }), input({ ...aimRight, firing: true }), 0.5);
+    expect(game.bullets).toHaveLength(6);
+    const angles = game.bullets.map(angleOf);
+    for (const angle of angles) expect(Math.abs(angle)).toBeLessThanOrEqual(4 + 1e-9);
+    expect(new Set(angles.map((a) => a.toFixed(3))).size).toBeGreaterThan(1);
+  });
+
+  it('kills a line of zombies with one sniper bullet', () => {
+    let game = step(playingGame([[500, 300], [550, 300], [600, 300], [700, 50]], [], { weapon: 'sniper' }), input({ ...aimRight, firing: true }), STEP);
+    game = run(game, input(aimRight), 0.3);
+    expect(game.zombies).toHaveLength(1);
+  });
+
+  it('still stops sniper bullets at walls', () => {
+    const wall = { x: 500, y: 240, w: 20, h: 120 };
+    let game = step(playingGame([[600, 300]], [wall], { weapon: 'sniper' }), input({ ...aimRight, firing: true }), STEP);
+    game = run(game, input(aimRight), 0.3);
+    expect(game.zombies).toHaveLength(1);
   });
 });
 
@@ -368,6 +456,22 @@ describe('obstacles', () => {
     const wall = { x: 300, y: 200, w: 20, h: 200 };
     const game = runUntilCaught(playingGame([[200, 300]], [wall]), 8);
     expect(game.phase).toBe('gameOver');
+  });
+
+  it('moves a zombie somewhere else if it has no way to reach the player', () => {
+    // A sealed box the zombie can never get out of.
+    const box = [
+      { x: 900, y: 200, w: 100, h: 20 },
+      { x: 900, y: 300, w: 100, h: 20 },
+      { x: 900, y: 220, w: 20, h: 80 },
+      { x: 980, y: 220, w: 20, h: 80 },
+    ];
+    const inBox = (z) => z.x > 900 && z.x < 1000 && z.y > 200 && z.y < 320;
+    let game = playingGame([[950, 260]], box);
+    game = run(game, input(), 1.5);
+    expect(inBox(game.zombies[0])).toBe(true); // still trapped after 1.5 s
+    game = run(game, input(), 1);
+    expect(inBox(game.zombies[0])).toBe(false); // moved somewhere it can reach the player
   });
 
   it('sends zombies into a room through its only doorway', () => {
@@ -426,5 +530,65 @@ describe('jumping', () => {
   it('still gets caught by a zombie mid-air', () => {
     const game = step(playingGame([[420, 300]]), input({ jump: true }), STEP);
     expect(game.phase).toBe('gameOver');
+  });
+});
+
+describe('bullets come out of the gun', () => {
+  const aimRight = { mouseX: 700, mouseY: 300 };
+  // Fires one shot (from a fresh game, or the one given) and returns where the
+  // bullet started: its position minus the one step it has already flown.
+  function firstShot(game) {
+    game = step(game, input({ ...aimRight, firing: true }), STEP);
+    const b = game.bullets[game.bullets.length - 1];
+    return { x: b.x - b.vx * STEP, y: b.y - b.vy * STEP, z: b.z, playerZ: game.player.z };
+  }
+
+  // Fires one shot right (standing, or from mid-jump) past an obstacle at
+  // x 500-540, and says whether the bullet made it to the far side.
+  function getsPast(obstacle, { jumping = false } = {}) {
+    let game = emptyGame({ obstacles: [obstacle] });
+    if (jumping) {
+      game = step(game, input({ jump: true }), STEP);
+      game = run(game, input(), 0.15); // up in the air
+    }
+    game = step(game, input({ ...aimRight, firing: true }), STEP);
+    game = run(game, input(aimRight), 0.4); // long enough to reach x 600+
+    return game.bullets.some((b) => b.x > 560);
+  }
+
+  it('starts a rifle bullet at the end of the barrel, 26 ahead and 3 to the right', () => {
+    const start = firstShot(emptyGame());
+    expect(start.x).toBeCloseTo(426);
+    expect(start.y).toBeCloseTo(303);
+    expect(start.z).toBe(39);
+  });
+
+  it('fires the long sniper from further out than the short SMG', () => {
+    const sniper = firstShot(emptyGame({ weapon: 'sniper' }));
+    const smg = firstShot(emptyGame({ weapon: 'smg' }));
+    expect(sniper.x).toBeGreaterThan(smg.x + 10);
+  });
+
+  it('fires from higher up while jumping', () => {
+    let game = step(emptyGame(), input({ jump: true }), STEP);
+    game = run(game, input(), 0.2);
+    const shot = firstShot(game);
+    expect(shot.playerZ).toBeGreaterThan(20);
+    expect(shot.z).toBeCloseTo(shot.playerZ + 39);
+  });
+
+  it('shoots over a low wall (below gun height)', () => {
+    expect(getsPast({ x: 500, y: 240, w: 40, h: 120, height: 36 })).toBe(true);
+  });
+
+  it('is stopped by a crate when standing, but a jump-shot clears it', () => {
+    const crate = { x: 500, y: 240, w: 40, h: 120, height: 40 };
+    expect(getsPast(crate)).toBe(false);
+    expect(getsPast(crate, { jumping: true })).toBe(true);
+  });
+
+  it('is always stopped by a tall wall, even mid-jump', () => {
+    const wall = { x: 500, y: 240, w: 40, h: 120, height: 96 };
+    expect(getsPast(wall, { jumping: true })).toBe(false);
   });
 });

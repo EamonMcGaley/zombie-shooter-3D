@@ -7,15 +7,13 @@
 
 import * as THREE from 'three';
 import { CAMERA_HEIGHT } from './camera.js';
-import { ARENA } from './map.js';
+import { ARENA, HEIGHTS } from './map.js';
 
-const WALL_HEIGHT = 96;
-const LOW_WALL_HEIGHT = 36;
-const BULLET_HEIGHT = 34; // below crate and low-wall tops, so bullets visibly hit them
 const CHARACTER_SCALE = 0.75;
 const LOOK_HEIGHT = 42; // the camera looks ahead at about this height
 const CAR_COLOURS = [0xa4262c, 0x2d5d9f, 0xc9c9c9, 0x3f3f3f];
 const FLOOR_COLOURS = { house: 0x4a3b2c, shed: 0x38452f };
+const WALL_COLOURS = { house: 0x8f8678, shed: 0x8f8678, wall: 0x8f8678, perimeter: 0x5f6266 };
 const SKY = 0x4a5a72; // early-evening blue
 
 const materials = new Map();
@@ -27,9 +25,9 @@ function material(colour, glow = false) {
   return materials.get(key);
 }
 
-// A box whose centre is at (x, y, z).
+// A box whose centre is at (x, y, z). `mat` is a material or a colour.
 function box(w, h, d, mat, x = 0, y = 0, z = 0) {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), typeof mat === 'number' ? material(mat) : mat);
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat instanceof THREE.Material ? mat : material(mat));
   mesh.position.set(x, y, z);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
@@ -41,10 +39,11 @@ function turnTo(object, angle) {
   object.rotation.y = -angle;
 }
 
-export function createView3D(canvas) {
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.shadowMap.enabled = true;
+// light: true for phones: no shadows, no antialiasing, lower resolution.
+export function createView3D(canvas, { light = false } = {}) {
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: !light });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, light ? 1.25 : 2));
+  renderer.shadowMap.enabled = !light;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
   const scene = new THREE.Scene();
@@ -55,11 +54,13 @@ export function createView3D(canvas) {
 
   // Dusk lighting: soft sky light plus a low sun that casts shadows. The sun
   // follows the player, so shadows stay sharp near you on the big map.
-  scene.add(new THREE.HemisphereLight(0xb8c8e8, 0x5a5444, 3.2));
-  scene.add(new THREE.AmbientLight(0xffffff, 0.6)); // lifts the shady sides of walls
-  const sun = new THREE.DirectionalLight(0xffe2b8, 3.2);
+  const LIGHT = { sky: 3.2, ambient: 0.6, sun: 3.2 };
+  const skyLight = new THREE.HemisphereLight(0xb8c8e8, 0x5a5444, LIGHT.sky);
+  const ambient = new THREE.AmbientLight(0xffffff, LIGHT.ambient); // lifts the shady sides of walls
+  scene.add(skyLight, ambient);
+  const sun = new THREE.DirectionalLight(0xffe2b8, LIGHT.sun);
   const SUN_OFFSET = new THREE.Vector3(400, 700, -400);
-  sun.castShadow = true;
+  sun.castShadow = !light;
   sun.shadow.mapSize.set(2048, 2048);
   Object.assign(sun.shadow.camera, { left: -600, right: 600, top: 600, bottom: -600, near: 10, far: 2500 });
   scene.add(sun, sun.target);
@@ -77,8 +78,24 @@ export function createView3D(canvas) {
 
   let mapGroup = null;
   let mapFor = null;
-  const player = makePerson(false);
+  let player = makePerson(null);
   scene.add(player.group);
+
+  // Swaps the player's model for a survivor's look and gun.
+  function setCharacter(character) {
+    scene.remove(player.group);
+    player = makePerson(character);
+    scene.add(player.group);
+  }
+
+  // 1 is full brightness; 0.75 is the dimmest round.
+  function setBrightness(b) {
+    skyLight.intensity = LIGHT.sky * b;
+    ambient.intensity = LIGHT.ambient * b;
+    sun.intensity = LIGHT.sun * b;
+    scene.background.setHex(SKY).multiplyScalar(b);
+    scene.fog.color.copy(scene.background);
+  }
   const zombies = [];
   const bullets = [];
   let playerStride = 0;
@@ -98,12 +115,12 @@ export function createView3D(canvas) {
     player.group.position.set(game.player.x, game.player.z, game.player.y);
     sun.target.position.set(game.player.x, 0, game.player.y);
     sun.position.copy(sun.target.position).add(SUN_OFFSET);
-    turnTo(player.group, view.yaw);
+    turnTo(player.group, view.facing ?? view.yaw); // the gun points where bullets go
     walk(player, playerStride);
 
     // Zombies: reuse meshes, adding more when a round needs them.
     while (zombies.length < game.zombies.length) {
-      const zombie = makePerson(true);
+      const zombie = makePerson('zombie');
       zombies.push(zombie);
       scene.add(zombie.group);
     }
@@ -128,7 +145,7 @@ export function createView3D(canvas) {
       tracer.visible = Boolean(bullet);
       if (!bullet) return;
       const angle = Math.atan2(bullet.vy, bullet.vx);
-      tracer.position.set(bullet.x - Math.cos(angle) * 9, BULLET_HEIGHT, bullet.y - Math.sin(angle) * 9);
+      tracer.position.set(bullet.x - Math.cos(angle) * 9, bullet.z, bullet.y - Math.sin(angle) * 9); // at the height it was fired from
       turnTo(tracer, angle);
     });
 
@@ -145,37 +162,83 @@ export function createView3D(canvas) {
     camera.updateProjectionMatrix();
   }
 
-  return { render, resize };
+  return { render, resize, setCharacter, setBrightness };
 }
 
 // --- Map ---
 
 function buildMap(game) {
   const group = new THREE.Group();
-  const inside = (piece, r) => r.x >= piece.x && r.y >= piece.y && r.x + r.w <= piece.x + piece.w && r.y + r.h <= piece.y + piece.h;
 
-  game.pieces.forEach((piece, i) => {
-    if (FLOOR_COLOURS[piece.kind]) {
-      const floor = new THREE.Mesh(new THREE.PlaneGeometry(piece.w, piece.h), material(FLOOR_COLOURS[piece.kind]));
-      floor.rotation.x = -Math.PI / 2;
-      floor.position.set(piece.x + piece.w / 2, 0.5, piece.y + piece.h / 2);
-      floor.receiveShadow = true;
-      group.add(floor);
-    }
-    if (piece.kind === 'car') group.add(makeCar(piece, CAR_COLOURS[(game.seed + i) % CAR_COLOURS.length]));
-    if (piece.kind === 'crate') group.add(box(piece.w, 40, piece.h, crateMaterial(), piece.x + piece.w / 2, 20, piece.y + piece.h / 2));
-    if (piece.kind === 'lowWall') {
-      group.add(box(piece.w, LOW_WALL_HEIGHT, piece.h, 0x6e6e6e, piece.x + piece.w / 2, LOW_WALL_HEIGHT / 2, piece.y + piece.h / 2));
-    }
-  });
-
-  // Building walls, plus any obstacle that isn't part of a piece.
-  for (const wall of game.obstacles) {
-    const owner = game.pieces.find((p) => inside(p, wall));
-    if (owner && !FLOOR_COLOURS[owner.kind]) continue;
-    group.add(box(wall.w, WALL_HEIGHT, wall.h, 0x8f8678, wall.x + wall.w / 2, WALL_HEIGHT / 2, wall.y + wall.h / 2));
+  // Floors inside buildings
+  for (const piece of game.pieces) {
+    if (!piece.doorways) continue;
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(piece.w, piece.h), material(FLOOR_COLOURS[piece.kind] ?? FLOOR_COLOURS.house));
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(piece.x + piece.w / 2, 0.5, piece.y + piece.h / 2);
+    floor.receiveShadow = true;
+    group.add(floor);
   }
+
+  game.obstacles.forEach((o, i) => {
+    const height = o.height ?? HEIGHTS.wall;
+    const cx = o.x + o.w / 2;
+    const cz = o.y + o.h / 2;
+    if (o.kind === 'car') group.add(makeCar(o, CAR_COLOURS[i % CAR_COLOURS.length]));
+    else if (o.kind === 'bus') group.add(makeBus(o));
+    else if (o.kind === 'container') group.add(makeContainer(o));
+    else if (o.kind === 'crate') group.add(box(o.w, height, o.h, crateMaterial(), cx, height / 2, cz));
+    else if (o.kind === 'lowWall') group.add(box(o.w, height, o.h, 0x6e6e6e, cx, height / 2, cz));
+    else if (o.kind === 'fence') group.add(makeFence(o));
+    else group.add(box(o.w, height, o.h, o.colour ?? WALL_COLOURS[o.kind] ?? 0x8f8678, cx, height / 2, cz)); // walls
+  });
   return group;
+}
+
+// Something long, lying along x, turned to match a map rectangle.
+function placeAlong(object, rect) {
+  object.position.set(rect.x + rect.w / 2, 0, rect.y + rect.h / 2);
+  if (rect.h > rect.w) object.rotation.y = Math.PI / 2;
+  return object;
+}
+
+function makeBus(rect) {
+  const length = Math.max(rect.w, rect.h);
+  const width = Math.min(rect.w, rect.h);
+  const bus = new THREE.Group();
+  bus.add(box(length, 58, width, 0xe8b923, 0, 41, 0)); // yellow body
+  bus.add(box(length * 0.92, 14, width + 1, 0x1d2733, 0, 54, 0)); // window strip
+  bus.add(box(length, 3, width + 1, 0x222222, 0, 30, 0)); // black stripe
+  for (const [x, z] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+    const wheel = new THREE.Mesh(new THREE.CylinderGeometry(11, 11, 6, 14), material(0x111111));
+    wheel.rotation.x = Math.PI / 2;
+    wheel.position.set(x * length * 0.35, 11, z * (width / 2 - 2));
+    bus.add(wheel);
+  }
+  return placeAlong(bus, rect);
+}
+
+function makeContainer(rect) {
+  const length = Math.max(rect.w, rect.h);
+  const width = Math.min(rect.w, rect.h);
+  const colour = new THREE.Color(rect.colour ?? '#a4442c');
+  const darker = colour.clone().multiplyScalar(0.7);
+  const container = new THREE.Group();
+  container.add(box(length, HEIGHTS.container, width, colour.getHex(), 0, HEIGHTS.container / 2, 0));
+  // Ridges down the long sides, like corrugated steel.
+  for (let x = -length / 2 + 10; x < length / 2; x += 14) {
+    container.add(box(4, HEIGHTS.container - 8, width + 2, darker.getHex(), x, HEIGHTS.container / 2, 0));
+  }
+  return placeAlong(container, rect);
+}
+
+function makeFence(rect) {
+  const length = Math.max(rect.w, rect.h);
+  const fence = new THREE.Group();
+  fence.add(box(length, 4, 3, 0xf2f2f2, 0, 22, 0)); // rail
+  fence.add(box(length, 4, 3, 0xf2f2f2, 0, 10, 0)); // rail
+  for (let x = -length / 2 + 4; x < length / 2; x += 9) fence.add(box(5, HEIGHTS.fence, 2, 0xffffff, x, HEIGHTS.fence / 2, 1.5)); // pickets
+  return placeAlong(fence, rect);
 }
 
 function makeCar(piece, colour) {
@@ -191,9 +254,7 @@ function makeCar(piece, colour) {
     wheel.position.set(x * length * 0.32, 9, z * (width / 2 - 2));
     car.add(wheel);
   }
-  car.position.set(piece.x + piece.w / 2, 0, piece.y + piece.h / 2);
-  if (piece.h > piece.w) car.rotation.y = Math.PI / 2;
-  return car;
+  return placeAlong(car, piece);
 }
 
 let crate = null;
@@ -222,10 +283,12 @@ function crateMaterial() {
 // --- Characters ---
 // Built facing +x, about 76 tall. Legs and arms hang from pivots so they can swing.
 
-function makePerson(isZombie) {
-  const skin = isZombie ? 0x86b26f : 0xe0ac69;
-  const shirt = isZombie ? 0x6b5d45 : 0x3a86ff;
-  const trousers = isZombie ? 0x3b3b52 : 0x23395d;
+// `who` is 'zombie', or a survivor from characters.js (null means the default look).
+function makePerson(who) {
+  const isZombie = who === 'zombie';
+  const looks = isZombie
+    ? { skin: 0x86b26f, shirt: 0x6b5d45, trousers: 0x3b3b52 }
+    : { skin: 0xe0ac69, shirt: 0x3a86ff, trousers: 0x23395d, hair: 0x4a2f1b, ...who?.colours };
   const group = new THREE.Group();
 
   const limb = (x, y, z, w, h, colour) => {
@@ -235,12 +298,12 @@ function makePerson(isZombie) {
     group.add(pivot);
     return pivot;
   };
-  const legL = limb(0, 30, -5, 8, 30, trousers);
-  const legR = limb(0, 30, 5, 8, 30, trousers);
-  group.add(box(12, 30, 22, shirt, 0, 45, 0)); // body
-  group.add(box(15, 15, 15, skin, 0, 68.5, 0)); // head
-  const armL = limb(0, 57, -14, 7, 24, isZombie ? skin : shirt);
-  const armR = limb(0, 57, 14, 7, 24, isZombie ? skin : shirt);
+  const legL = limb(0, 30, -5, 8, 30, looks.trousers);
+  const legR = limb(0, 30, 5, 8, 30, looks.trousers);
+  group.add(box(12, 30, 22, looks.shirt, 0, 45, 0)); // body
+  group.add(box(15, 15, 15, looks.skin, 0, 68.5, 0)); // head
+  const armL = limb(0, 57, -14, 7, 24, isZombie ? looks.skin : looks.shirt);
+  const armR = limb(0, 57, 14, 7, 24, isZombie ? looks.skin : looks.shirt);
 
   if (isZombie) {
     group.add(box(13, 8, 9, 0x4e8040, 0.5, 38, 7)); // torn patch
@@ -248,15 +311,37 @@ function makePerson(isZombie) {
     for (const z of [-3.5, 3.5]) group.add(box(1, 2.5, 2.5, material(0xff2a2a, true), 7.8, 70, z)); // red eyes
     armL.rotation.z = armR.rotation.z = Math.PI / 2; // arms reaching forward
   } else {
-    group.add(box(16, 4, 16, 0x4a2f1b, -0.5, 77.5, 0)); // hair
-    group.add(box(4, 10, 16, 0x4a2f1b, -6.5, 71, 0)); // back of the hair
+    group.add(box(16, 4, 16, looks.hair, -0.5, 77.5, 0)); // hair
+    group.add(box(4, 10, 16, looks.hair, -6.5, 71, 0)); // back of the hair
+    if (who?.id === 'ivy') group.add(box(4, 14, 5, looks.hair, -10, 64, 0)); // ponytail
     // Both arms swing forward, then turn inward to hold the gun.
     armL.rotation.set(0, -0.45, 1.45, 'YZX');
     armR.rotation.set(0, 0.35, 1.5, 'YZX');
-    group.add(box(26, 6, 5, 0x2b2b2b, 22, 52, 4)); // gun
+    group.add(makeGun(who?.weapon ?? 'rifle'));
   }
   group.scale.setScalar(CHARACTER_SCALE);
   return { group, legL, legR, armL, armR, isZombie };
+}
+
+// Each weapon has its own shape, held out in front at chest height.
+function makeGun(weapon) {
+  const gun = new THREE.Group();
+  if (weapon === 'shotgun') {
+    gun.add(box(30, 6, 6, 0x3a3a3a, 23, 52, 4)); // barrel
+    gun.add(box(9, 5, 7, 0x6b4520, 27, 48, 4)); // wooden pump
+    gun.add(box(10, 7, 5, 0x6b4520, 6, 50, 4)); // stock
+  } else if (weapon === 'smg') {
+    gun.add(box(17, 8, 5, 0x2b2b2b, 18, 52, 4)); // body
+    gun.add(box(3, 11, 3, 0x1a1a1a, 19, 44, 4)); // magazine
+  } else if (weapon === 'sniper') {
+    gun.add(box(42, 4, 4, 0x2f3b2f, 27, 53, 4)); // long barrel
+    gun.add(box(12, 4, 4, 0x111111, 18, 58, 4)); // scope
+    gun.add(box(10, 7, 5, 0x4a3b2c, 4, 51, 4)); // stock
+  } else {
+    gun.add(box(26, 6, 5, 0x2b2b2b, 22, 52, 4)); // rifle
+    gun.add(box(3, 9, 3, 0x1a1a1a, 20, 46, 4)); // magazine
+  }
+  return gun;
 }
 
 // Swings legs (and zombie arms) based on how far the character has moved.
