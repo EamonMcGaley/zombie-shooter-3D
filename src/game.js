@@ -1,6 +1,8 @@
 // Game rules for Zombie Arena. No browser code in here, so it can be tested.
 // See .scratch/arena-shooter/spec.md for the rules this implements.
 
+import { generateMap, blockedTiles, distancesFrom, TILE, COLS, ROWS } from './map.js';
+
 export const ARENA = { width: 800, height: 600 };
 export const PLAYER_SPEED = 200;
 export const PLAYER_RADIUS = 12;
@@ -30,9 +32,19 @@ export function spawnIntervalForRound(round) {
 
 // --- The game ---
 
-export function createGame({ random = Math.random } = {}) {
+// `obstacles` replaces the generated map (tests use [] for an empty arena).
+export function createGame({ random = Math.random, seed, obstacles } = {}) {
+  let pieces = [];
+  if (obstacles === undefined) {
+    seed ??= Math.floor(Math.random() * 1_000_000);
+    ({ pieces, obstacles } = generateMap(seed));
+  }
   return {
     random,
+    seed: seed ?? null,
+    pieces,
+    obstacles,
+    blocked: blockedTiles(obstacles),
     round: 1,
     phase: 'roundBreak', // 'roundBreak' | 'playing' | 'gameOver'
     breakTimer: ROUND_BREAK,
@@ -49,6 +61,7 @@ export function step(game, input, dt) {
   if (game.phase === 'gameOver') return game;
 
   movePlayer(game.player, input, dt);
+  pushOutOfObstacles(game.player, game.obstacles);
   fire(game, input, dt);
   moveBullets(game, dt);
 
@@ -61,6 +74,7 @@ export function step(game, input, dt) {
   spawnZombies(game, dt);
   moveZombies(game, dt);
   pushZombiesApart(game.zombies);
+  for (const zombie of game.zombies) pushOutOfObstacles(zombie, game.obstacles);
   shootZombies(game);
 
   if (game.zombies.some((z) => touching(z, game.player))) {
@@ -143,7 +157,9 @@ function moveBullets(game, dt) {
     bullet.x += bullet.vx * dt;
     bullet.y += bullet.vy * dt;
   }
-  game.bullets = game.bullets.filter(insideArena);
+  game.bullets = game.bullets.filter(
+    (bullet) => insideArena(bullet) && !game.obstacles.some((o) => overlapDepth(bullet, o) > 0),
+  );
 }
 
 function shootZombies(game) {
@@ -190,14 +206,78 @@ function spawnPoint(game) {
 
 function moveZombies(game, dt) {
   const speed = zombieSpeedForRound(game.round);
+  // Flow field: one search from the player's tile, shared by every zombie.
+  const distance = distancesFrom([tileIndex(game.player)], game.blocked);
   for (const zombie of game.zombies) {
-    const dx = game.player.x - zombie.x;
-    const dy = game.player.y - zombie.y;
+    const target = clearLine(zombie, game.player, game.obstacles)
+      ? game.player
+      : nextTileTowardsPlayer(zombie, distance, game.blocked) ?? game.player;
+    const dx = target.x - zombie.x;
+    const dy = target.y - zombie.y;
     const length = Math.hypot(dx, dy);
     if (length === 0) continue;
     zombie.x += (dx / length) * speed * dt;
     zombie.y += (dy / length) * speed * dt;
   }
+}
+
+// The centre of the neighbouring tile that's fewest steps from the player,
+// or null if no neighbour is closer than where the zombie already is.
+function nextTileTowardsPlayer(zombie, distance, blocked) {
+  const here = tileIndex(zombie);
+  const c = here % COLS;
+  const r = Math.floor(here / COLS);
+  const open = (nc, nr) => nc >= 0 && nr >= 0 && nc < COLS && nr < ROWS && !blocked[nr * COLS + nc];
+  let best = null;
+  let bestDistance = distance[here];
+  for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+    const nc = c + dc;
+    const nr = r + dr;
+    if (!open(nc, nr)) continue;
+    // A diagonal step would cut the corner of a wall unless both sides are open.
+    if (dc !== 0 && dr !== 0 && (!open(c + dc, r) || !open(c, r + dr))) continue;
+    const d = distance[nr * COLS + nc];
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = { x: (nc + 0.5) * TILE, y: (nr + 0.5) * TILE };
+    }
+  }
+  return best;
+}
+
+// The tile a point is on. Points outside the arena use the nearest edge tile.
+function tileIndex(point) {
+  const c = clamp(Math.floor(point.x / TILE), 0, COLS - 1);
+  const r = clamp(Math.floor(point.y / TILE), 0, ROWS - 1);
+  return r * COLS + c;
+}
+
+// True if a circle could slide straight from `from` to `to` without touching
+// an obstacle: the line misses every obstacle widened by the circle's radius.
+function clearLine(from, to, obstacles) {
+  return obstacles.every((o) => !lineHitsRect(from, to, grow(o, from.r)));
+}
+
+function lineHitsRect(a, b, rect) {
+  // Slab method: find where the line enters and leaves the rectangle's x and y ranges.
+  let enter = 0;
+  let leave = 1;
+  for (const [start, delta, min, max] of [
+    [a.x, b.x - a.x, rect.x, rect.x + rect.w],
+    [a.y, b.y - a.y, rect.y, rect.y + rect.h],
+  ]) {
+    if (delta === 0) {
+      if (start <= min || start >= max) return false;
+      continue;
+    }
+    let t1 = (min - start) / delta;
+    let t2 = (max - start) / delta;
+    if (t1 > t2) [t1, t2] = [t2, t1];
+    enter = Math.max(enter, t1);
+    leave = Math.min(leave, t2);
+    if (enter >= leave) return false;
+  }
+  return true;
 }
 
 function pushZombiesApart(zombies) {
@@ -217,6 +297,50 @@ function pushZombiesApart(zombies) {
       b.y += (ny * overlap) / 2;
     }
   }
+}
+
+// --- Obstacles ---
+
+// Moves a circle the shortest way out of any obstacle it overlaps. Pushing
+// straight out from the nearest edge is what lets things slide along walls.
+function pushOutOfObstacles(circle, obstacles) {
+  for (let pass = 0; pass < 2; pass++) {
+    for (const o of obstacles) {
+      const depth = overlapDepth(circle, o);
+      if (depth === 0) continue;
+      const nearestX = clamp(circle.x, o.x, o.x + o.w);
+      const nearestY = clamp(circle.y, o.y, o.y + o.h);
+      const dx = circle.x - nearestX;
+      const dy = circle.y - nearestY;
+      const length = Math.hypot(dx, dy);
+      if (length > 0) {
+        circle.x += (dx / length) * depth;
+        circle.y += (dy / length) * depth;
+      } else {
+        // Centre is inside the rectangle: leave by the closest side.
+        const exits = [
+          { d: circle.x - o.x + circle.r, x: o.x - circle.r, y: circle.y },
+          { d: o.x + o.w - circle.x + circle.r, x: o.x + o.w + circle.r, y: circle.y },
+          { d: circle.y - o.y + circle.r, x: circle.x, y: o.y - circle.r },
+          { d: o.y + o.h - circle.y + circle.r, x: circle.x, y: o.y + o.h + circle.r },
+        ];
+        const exit = exits.reduce((a, b) => (b.d < a.d ? b : a));
+        circle.x = exit.x;
+        circle.y = exit.y;
+      }
+    }
+  }
+}
+
+// How far a circle pokes into a rectangle (0 if it doesn't).
+function overlapDepth(circle, rect) {
+  const nearestX = clamp(circle.x, rect.x, rect.x + rect.w);
+  const nearestY = clamp(circle.y, rect.y, rect.y + rect.h);
+  return Math.max(0, circle.r - Math.hypot(circle.x - nearestX, circle.y - nearestY));
+}
+
+function grow(rect, by) {
+  return { x: rect.x - by, y: rect.y - by, w: rect.w + 2 * by, h: rect.h + 2 * by };
 }
 
 // --- Helpers ---

@@ -15,7 +15,11 @@ const ctx = canvas.getContext('2d');
 const input = { up: false, down: false, left: false, right: false, mouseX: 0, mouseY: 0, firing: false };
 const keyMap = { KeyW: 'up', KeyS: 'down', KeyA: 'left', KeyD: 'right' };
 
-let game = createGame();
+// A map seed in the address (?seed=123) replays that map; otherwise every game gets a new one.
+const urlSeed = Number.parseInt(new URLSearchParams(location.search).get('seed'), 10);
+const newGame = () => createGame({ seed: Number.isNaN(urlSeed) ? undefined : urlSeed });
+
+let game = newGame();
 let best = loadBest();
 
 // --- Input: keyboard and mouse ---
@@ -26,7 +30,7 @@ let controllerAim = { x: 1, y: 0 }; // last right-stick direction
 
 window.addEventListener('keydown', (e) => {
   if (keyMap[e.code]) input[keyMap[e.code]] = true;
-  if (e.code === 'KeyR' && game.phase === 'gameOver') game = createGame();
+  if (e.code === 'KeyR' && game.phase === 'gameOver') game = newGame();
 });
 window.addEventListener('keyup', (e) => {
   if (keyMap[e.code]) input[keyMap[e.code]] = false;
@@ -64,7 +68,7 @@ function readInput() {
     moveY += controller.move.y;
     if (controller.aim) controllerAim = controller.aim;
     controllerFiring = controller.firing;
-    if (controller.restart && game.phase === 'gameOver') game = createGame();
+    if (controller.restart && game.phase === 'gameOver') game = newGame();
   }
 
   input.moveX = moveX;
@@ -193,6 +197,95 @@ function drawZombie(zombie) {
   ctx.restore();
 }
 
+// --- Map ---
+
+const FLOOR = { house: '#4a3b2c', shed: '#38452f' };
+const CAR_COLOURS = ['#a4262c', '#2d5d9f', '#c9c9c9', '#3f3f3f'];
+
+function contains(piece, rect) {
+  return rect.x >= piece.x && rect.y >= piece.y && rect.x + rect.w <= piece.x + piece.w && rect.y + rect.h <= piece.y + piece.h;
+}
+
+function drawMap() {
+  // Floors inside buildings
+  for (const piece of game.pieces) {
+    if (FLOOR[piece.kind]) {
+      ctx.fillStyle = FLOOR[piece.kind];
+      ctx.fillRect(piece.x, piece.y, piece.w, piece.h);
+    }
+  }
+  // Building walls (and hand-placed obstacles, which belong to no piece)
+  for (const wall of game.obstacles) {
+    const owner = game.pieces.find((p) => contains(p, wall));
+    if (owner && !FLOOR[owner.kind]) continue;
+    ctx.fillStyle = '#8f8678';
+    ctx.fillRect(wall.x, wall.y, wall.w, wall.h);
+    ctx.strokeStyle = '#5c554b';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(wall.x + 1, wall.y + 1, wall.w - 2, wall.h - 2);
+  }
+  game.pieces.forEach((piece, i) => {
+    if (piece.kind === 'car') drawCar(piece, CAR_COLOURS[(game.seed + i) % CAR_COLOURS.length]);
+    if (piece.kind === 'crate') drawCrate(piece);
+    if (piece.kind === 'lowWall') drawLowWall(piece);
+  });
+}
+
+function drawCar(car, colour) {
+  const horizontal = car.w > car.h;
+  ctx.save();
+  ctx.translate(car.x + car.w / 2, car.y + car.h / 2);
+  if (!horizontal) ctx.rotate(Math.PI / 2);
+  const length = Math.max(car.w, car.h);
+  const width = Math.min(car.w, car.h);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+  ctx.fillRect(-length / 2 + 2, -width / 2 + 3, length, width);
+  ctx.fillStyle = colour;
+  ctx.beginPath();
+  ctx.roundRect(-length / 2, -width / 2, length, width, 8);
+  ctx.fill();
+  ctx.fillStyle = '#1d2733'; // windscreen and back window
+  ctx.fillRect(length * 0.12, -width / 2 + 5, 9, width - 10);
+  ctx.fillRect(-length * 0.32, -width / 2 + 6, 7, width - 12);
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.15)'; // roof
+  ctx.fillRect(-length * 0.22, -width / 2 + 6, length * 0.32, width - 12);
+  ctx.restore();
+}
+
+function drawCrate(crate) {
+  ctx.fillStyle = '#9c6b30';
+  ctx.fillRect(crate.x, crate.y, crate.w, crate.h);
+  ctx.strokeStyle = '#6b4520';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(crate.x + 1.5, crate.y + 1.5, crate.w - 3, crate.h - 3);
+  ctx.beginPath();
+  ctx.moveTo(crate.x + 3, crate.y + 3);
+  ctx.lineTo(crate.x + crate.w - 3, crate.y + crate.h - 3);
+  ctx.moveTo(crate.x + crate.w - 3, crate.y + 3);
+  ctx.lineTo(crate.x + 3, crate.y + crate.h - 3);
+  ctx.stroke();
+}
+
+function drawLowWall(wall) {
+  ctx.fillStyle = '#6e6e6e';
+  ctx.fillRect(wall.x, wall.y, wall.w, wall.h);
+  ctx.strokeStyle = '#4d4d4d';
+  ctx.lineWidth = 1.5;
+  const horizontal = wall.w > wall.h;
+  for (let i = 20; i < Math.max(wall.w, wall.h); i += 20) {
+    ctx.beginPath();
+    if (horizontal) {
+      ctx.moveTo(wall.x + i, wall.y);
+      ctx.lineTo(wall.x + i, wall.y + wall.h);
+    } else {
+      ctx.moveTo(wall.x, wall.y + i);
+      ctx.lineTo(wall.x + wall.w, wall.y + i);
+    }
+    ctx.stroke();
+  }
+  ctx.strokeRect(wall.x, wall.y, wall.w, wall.h);
+}
+
 function drawBullet(bullet) {
   const tail = 0.02; // tracer length, in seconds of travel
   limb(bullet.x - bullet.vx * tail, bullet.y - bullet.vy * tail, bullet.x, bullet.y, 3, '#ffd23f');
@@ -208,6 +301,7 @@ function centredText(text, y, size, colour) {
 function draw() {
   ctx.clearRect(0, 0, ARENA.width, ARENA.height);
 
+  drawMap();
   for (const bullet of game.bullets) drawBullet(bullet);
   for (const zombie of game.zombies) drawZombie(zombie);
   drawPlayer(game.player);
@@ -220,6 +314,11 @@ function draw() {
   ctx.fillText(`Zombies left: ${game.zombiesToSpawn + game.zombies.length}`, 12, 46);
   ctx.textAlign = 'right';
   ctx.fillText(`Best: ${Math.max(best, game.round)}`, ARENA.width - 12, 24);
+  if (game.seed !== null) {
+    ctx.fillStyle = '#888';
+    ctx.font = '13px system-ui, sans-serif';
+    ctx.fillText(`Map seed: ${game.seed}`, ARENA.width - 12, ARENA.height - 12);
+  }
 
   if (game.phase === 'roundBreak') {
     centredText(`ROUND ${game.round}`, ARENA.height / 2, 72, '#b5001b');
