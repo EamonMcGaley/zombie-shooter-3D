@@ -10,6 +10,7 @@ export const BULLET_SPEED = 500;
 export const BULLET_RADIUS = 3;
 export const ZOMBIE_RADIUS = 12;
 const MIN_SPAWN_DISTANCE = 250;
+const AIM_ASSIST_CONE = (30 * Math.PI) / 180;
 
 // --- Round rules ---
 
@@ -81,13 +82,17 @@ function startRound(game) {
 // --- Player ---
 
 function movePlayer(player, input, dt) {
-  const dx = (input.right ? 1 : 0) - (input.left ? 1 : 0);
-  const dy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  // Analog stick values if given, otherwise the WASD keys.
+  const analog = input.moveX !== undefined || input.moveY !== undefined;
+  const dx = analog ? input.moveX ?? 0 : (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  const dy = analog ? input.moveY ?? 0 : (input.down ? 1 : 0) - (input.up ? 1 : 0);
   const length = Math.hypot(dx, dy);
   if (length > 0) {
-    // Dividing by length stops diagonal movement being faster.
-    player.x += (dx / length) * PLAYER_SPEED * dt;
-    player.y += (dy / length) * PLAYER_SPEED * dt;
+    // Dividing by length stops diagonal movement being faster; a gentle
+    // stick push (length under 1) moves slower.
+    const strength = Math.min(length, 1);
+    player.x += (dx / length) * strength * PLAYER_SPEED * dt;
+    player.y += (dy / length) * strength * PLAYER_SPEED * dt;
   }
   player.x = clamp(player.x, player.r, ARENA.width - player.r);
   player.y = clamp(player.y, player.r, ARENA.height - player.r);
@@ -101,16 +106,36 @@ function fire(game, input, dt) {
   const { player } = game;
   const dx = input.mouseX - player.x;
   const dy = input.mouseY - player.y;
-  const length = Math.hypot(dx, dy);
-  if (length === 0) return;
+  if (dx === 0 && dy === 0) return;
+  const angle = Math.atan2(dy, dx) + aimAssistTurn(game, Math.atan2(dy, dx), input.aimAssist ?? 0);
   game.bullets.push({
     x: player.x,
     y: player.y,
     r: BULLET_RADIUS,
-    vx: (dx / length) * BULLET_SPEED,
-    vy: (dy / length) * BULLET_SPEED,
+    vx: Math.cos(angle) * BULLET_SPEED,
+    vy: Math.sin(angle) * BULLET_SPEED,
   });
   game.fireCooldown = 1 / FIRE_RATE;
+}
+
+// How far (in radians) to turn a shot towards the zombie nearest the aim, if
+// one is within AIM_ASSIST_CONE. A strength of 0.05 turns it 5% of the way.
+function aimAssistTurn(game, aim, strength) {
+  if (strength <= 0) return 0;
+  let best = null;
+  for (const zombie of game.zombies) {
+    const toZombie = Math.atan2(zombie.y - game.player.y, zombie.x - game.player.x);
+    const difference = angleBetween(aim, toZombie);
+    if (Math.abs(difference) <= AIM_ASSIST_CONE && (best === null || Math.abs(difference) < Math.abs(best))) {
+      best = difference;
+    }
+  }
+  return best === null ? 0 : best * strength;
+}
+
+// The signed angle to turn from `from` to `to`, between -180° and 180°.
+function angleBetween(from, to) {
+  return Math.atan2(Math.sin(to - from), Math.cos(to - from));
 }
 
 function moveBullets(game, dt) {

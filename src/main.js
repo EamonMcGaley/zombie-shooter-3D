@@ -2,10 +2,12 @@
 // All the rules live in game.js.
 
 import { createGame, step, ARENA } from './game.js';
+import { readGamepad } from './gamepad.js';
 
 const STEP = 1 / 60;
 const MAX_CATCH_UP = 0.25;
 const BEST_KEY = 'zombie-arena-best-round';
+const CONTROLLER_AIM_ASSIST = 0.05; // 5%: turn this up if aim assist feels too weak
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
@@ -16,7 +18,11 @@ const keyMap = { KeyW: 'up', KeyS: 'down', KeyA: 'left', KeyD: 'right' };
 let game = createGame();
 let best = loadBest();
 
-// --- Input ---
+// --- Input: keyboard and mouse ---
+
+const mouse = { x: 0, y: 0, firing: false };
+let aimWith = 'mouse'; // whichever was used last: 'mouse' or 'controller'
+let controllerAim = { x: 1, y: 0 }; // last right-stick direction
 
 window.addEventListener('keydown', (e) => {
   if (keyMap[e.code]) input[keyMap[e.code]] = true;
@@ -28,18 +34,53 @@ window.addEventListener('keyup', (e) => {
 canvas.addEventListener('mousemove', (e) => {
   // The canvas may be drawn smaller than 800x600, so scale back to game units.
   const rect = canvas.getBoundingClientRect();
-  input.mouseX = ((e.clientX - rect.left) / rect.width) * ARENA.width;
-  input.mouseY = ((e.clientY - rect.top) / rect.height) * ARENA.height;
+  mouse.x = ((e.clientX - rect.left) / rect.width) * ARENA.width;
+  mouse.y = ((e.clientY - rect.top) / rect.height) * ARENA.height;
+  aimWith = 'mouse';
 });
 canvas.addEventListener('mousedown', (e) => {
-  if (e.button === 0) input.firing = true;
+  if (e.button === 0) mouse.firing = true;
 });
 window.addEventListener('mouseup', (e) => {
-  if (e.button === 0) input.firing = false;
+  if (e.button === 0) mouse.firing = false;
 });
 window.addEventListener('blur', () => {
-  for (const key of Object.keys(input)) if (typeof input[key] === 'boolean') input[key] = false;
+  for (const key of Object.values(keyMap)) input[key] = false;
+  mouse.firing = false;
 });
+
+// --- Input: controller, read fresh every frame and combined with keyboard and mouse ---
+
+function readInput() {
+  let moveX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  let moveY = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  let controllerFiring = false;
+
+  const pad = [...(navigator.getGamepads?.() ?? [])].find(Boolean);
+  if (pad) {
+    const controller = readGamepad(pad);
+    if (controller.active) aimWith = 'controller';
+    moveX += controller.move.x;
+    moveY += controller.move.y;
+    if (controller.aim) controllerAim = controller.aim;
+    controllerFiring = controller.firing;
+    if (controller.restart && game.phase === 'gameOver') game = createGame();
+  }
+
+  input.moveX = moveX;
+  input.moveY = moveY;
+  input.firing = mouse.firing || controllerFiring;
+  if (aimWith === 'controller') {
+    // The rules aim at a point, so aim 100 px out in the stick's direction.
+    input.mouseX = game.player.x + controllerAim.x * 100;
+    input.mouseY = game.player.y + controllerAim.y * 100;
+    input.aimAssist = CONTROLLER_AIM_ASSIST;
+  } else {
+    input.mouseX = mouse.x;
+    input.mouseY = mouse.y;
+    input.aimAssist = 0;
+  }
+}
 
 // --- Best round (saved in the browser) ---
 
@@ -67,6 +108,7 @@ let leftover = 0;
 function frame(now) {
   leftover += Math.min((now - last) / 1000, MAX_CATCH_UP);
   last = now;
+  readInput();
   while (leftover >= STEP) {
     game = step(game, input, STEP);
     leftover -= STEP;

@@ -38,6 +38,17 @@ describe('movement', () => {
     expect(distance).toBeCloseTo(200);
   });
 
+  it('moves at half speed with the stick pushed halfway', () => {
+    const game = run(createGame(), input({ moveX: 0.5, moveY: 0 }), 1);
+    expect(game.player.x).toBeCloseTo(500);
+  });
+
+  it('moves no faster than full speed with the stick pushed fully diagonally', () => {
+    const game = run(createGame(), input({ moveX: 1, moveY: 1 }), 1);
+    const distance = Math.hypot(game.player.x - 400, game.player.y - 300);
+    expect(distance).toBeCloseTo(200);
+  });
+
   // These stay inside the opening 3 s pause, so no zombies can interfere.
   it('stops the player at the top-left edges', () => {
     const game = run(createGame(), input({ left: true, up: true }), 2.9);
@@ -214,5 +225,36 @@ describe('rounds', () => {
   it('counts the zombies left this round for the HUD', () => {
     const game = run(createGame(), input(), 3.05);
     expect(game.zombiesToSpawn + game.zombies.length).toBe(5);
+  });
+});
+
+describe('aim assist', () => {
+  // Fires one bullet aiming straight right from the centre, and returns its angle in degrees.
+  function shotAngle(zombies, aimAssist) {
+    const game = step(playingGame(zombies), input({ mouseX: 700, mouseY: 300, firing: true, aimAssist }), STEP);
+    const bullet = game.bullets[0];
+    return (Math.atan2(bullet.vy, bullet.vx) * 180) / Math.PI;
+  }
+
+  // A zombie 300 px from the centre of the arena, at `degrees` from straight right.
+  function zombieAt(degrees) {
+    const radians = (degrees * Math.PI) / 180;
+    return [400 + Math.cos(radians) * 300, 300 + Math.sin(radians) * 300];
+  }
+
+  it('turns a bullet 5% of the way towards a zombie near the aim', () => {
+    expect(shotAngle([zombieAt(10)], 0.05)).toBeCloseTo(0.5, 1);
+  });
+
+  it('leaves the bullet alone with no aim assist', () => {
+    expect(shotAngle([zombieAt(10)], 0)).toBeCloseTo(0);
+  });
+
+  it('ignores zombies more than 30 degrees from the aim', () => {
+    expect(shotAngle([zombieAt(45)], 0.05)).toBeCloseTo(0);
+  });
+
+  it('picks the zombie closest to the aim direction', () => {
+    expect(shotAngle([zombieAt(20), zombieAt(-8)], 0.05)).toBeCloseTo(-0.4, 1);
   });
 });
