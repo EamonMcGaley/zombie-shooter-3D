@@ -1,2 +1,7 @@
+# Rebuilt by npm install / npm run build
 node_modules/
 dist/
+
+# Local AI tooling: skill copies and Claude settings (reinstall from skills-lock.json)
+.agents/
+.claude/
