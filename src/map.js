@@ -3,25 +3,27 @@
 // See .scratch/obstacles/spec.md.
 
 export const TILE = 20;
-export const COLS = 40; // 800 px
-export const ROWS = 30; // 600 px
+export const COLS = 80; // 1600 px
+export const ROWS = 60; // 1200 px
+export const ARENA = { width: COLS * TILE, height: ROWS * TILE };
 
 const MARGIN = 2; // tiles kept clear at the arena edge
 const GAP = 2; // tiles kept clear between pieces
 const START_CLEARANCE = 100; // px kept clear around the player's start
 const CENTRE = { x: (COLS * TILE) / 2, y: (ROWS * TILE) / 2 };
 
+// How tall each kind of piece is. The player can jump over anything lower than a jump.
+export const HEIGHTS = { house: 96, shed: 96, car: 56, lowWall: 36, crate: 40 };
+
+const times = (count, piece) => Array.from({ length: count }, () => piece);
+
 // Placed biggest first, so the big pieces get the most room.
 const PIECES = [
-  { kind: 'house', w: 10, h: 7, doors: 2 },
-  { kind: 'shed', w: 6, h: 5, doors: 1 },
-  { kind: 'car', w: 4, h: 2, rotates: true },
-  { kind: 'car', w: 4, h: 2, rotates: true },
-  { kind: 'lowWall', w: 6, h: 1, rotates: true },
-  { kind: 'crate', w: 2, h: 2 },
-  { kind: 'crate', w: 2, h: 2 },
-  { kind: 'crate', w: 2, h: 2 },
-  { kind: 'crate', w: 2, h: 2 },
+  ...times(4, { kind: 'house', w: 10, h: 7, doors: 2 }),
+  ...times(4, { kind: 'shed', w: 6, h: 5, doors: 1 }),
+  ...times(8, { kind: 'car', w: 4, h: 2, rotates: true }),
+  ...times(4, { kind: 'lowWall', w: 6, h: 1, rotates: true }),
+  ...times(16, { kind: 'crate', w: 2, h: 2 }),
 ];
 
 export function generateMap(seed) {
@@ -79,13 +81,14 @@ function makeDoorways(random, piece, count) {
 
 // The solid rectangles of a piece: the whole thing, or a building's walls with gaps for doorways.
 function solidParts(piece) {
-  if (!piece.doorways) return [{ x: piece.x, y: piece.y, w: piece.w, h: piece.h }];
+  const height = HEIGHTS[piece.kind];
+  if (!piece.doorways) return [{ x: piece.x, y: piece.y, w: piece.w, h: piece.h, height }];
   const { x, y, w, h } = piece;
   const walls = [
-    { x, y, w, h: TILE }, // top
-    { x, y: y + h - TILE, w, h: TILE }, // bottom
-    { x, y: y + TILE, w: TILE, h: h - 2 * TILE }, // left
-    { x: x + w - TILE, y: y + TILE, w: TILE, h: h - 2 * TILE }, // right
+    { x, y, w, h: TILE, height }, // top
+    { x, y: y + h - TILE, w, h: TILE, height }, // bottom
+    { x, y: y + TILE, w: TILE, h: h - 2 * TILE, height }, // left
+    { x: x + w - TILE, y: y + TILE, w: TILE, h: h - 2 * TILE, height }, // right
   ];
   return walls.flatMap((wall) => piece.doorways.reduce((parts, door) => parts.flatMap((p) => cut(p, door)), [wall]));
 }

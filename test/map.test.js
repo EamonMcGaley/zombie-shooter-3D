@@ -1,9 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { generateMap } from '../src/map.js';
+import { generateMap, ARENA, TILE, COLS, ROWS } from '../src/map.js';
 
-const TILE = 20;
-const COLS = 40;
-const ROWS = 30;
+const CENTRE = { x: ARENA.width / 2, y: ARENA.height / 2 };
 const SEEDS = Array.from({ length: 100 }, (_, i) => i + 1);
 
 function count(map, kind) {
@@ -19,8 +17,8 @@ function grow(rect, by) {
 }
 
 function distanceToCentre(rect) {
-  const dx = Math.max(rect.x - 400, 0, 400 - (rect.x + rect.w));
-  const dy = Math.max(rect.y - 300, 0, 300 - (rect.y + rect.h));
+  const dx = Math.max(rect.x - CENTRE.x, 0, CENTRE.x - (rect.x + rect.w));
+  const dy = Math.max(rect.y - CENTRE.y, 0, CENTRE.y - (rect.y + rect.h));
   return Math.hypot(dx, dy);
 }
 
@@ -34,49 +32,64 @@ function side(piece, door) {
 
 // Counts open tiles, and how many of them can be reached from the arena edge.
 function reachability(obstacles) {
-  const open = (c, r) => !obstacles.some((o) => overlaps(o, { x: c * TILE, y: r * TILE, w: TILE, h: TILE }));
-  const seen = new Set();
+  // Mark blocked tiles obstacle by obstacle (fast even on a big map).
+  const blocked = new Array(COLS * ROWS).fill(false);
+  for (const o of obstacles) {
+    for (let r = Math.floor(o.y / TILE); r < Math.ceil((o.y + o.h) / TILE); r++) {
+      for (let c = Math.floor(o.x / TILE); c < Math.ceil((o.x + o.w) / TILE); c++) blocked[r * COLS + c] = true;
+    }
+  }
+  const seen = new Array(COLS * ROWS).fill(false);
   const queue = [];
-  let openCount = 0;
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
-      if (!open(c, r)) continue;
-      openCount++;
-      if (r === 0 || c === 0 || r === ROWS - 1 || c === COLS - 1) {
-        seen.add(`${c},${r}`);
+      const edge = r === 0 || c === 0 || r === ROWS - 1 || c === COLS - 1;
+      if (edge && !blocked[r * COLS + c]) {
+        seen[r * COLS + c] = true;
         queue.push([c, r]);
       }
     }
   }
-  while (queue.length) {
-    const [c, r] = queue.shift();
+  for (let head = 0; head < queue.length; head++) {
+    const [c, r] = queue[head];
     for (const [nc, nr] of [[c + 1, r], [c - 1, r], [c, r + 1], [c, r - 1]]) {
-      const key = `${nc},${nr}`;
-      if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS || seen.has(key) || !open(nc, nr)) continue;
-      seen.add(key);
+      const i = nr * COLS + nc;
+      if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS || seen[i] || blocked[i]) continue;
+      seen[i] = true;
       queue.push([nc, nr]);
     }
   }
-  return { openCount, reached: seen.size };
+  return { openCount: blocked.filter((b) => !b).length, reached: seen.filter(Boolean).length };
 }
 
 describe('generateMap', () => {
-  it('always has 1 house, 1 shed, 2 cars, 4 crates and 1 low wall', () => {
+  it('always has 4 houses, 4 sheds, 8 cars, 16 crates and 4 low walls', () => {
     for (const seed of SEEDS) {
       const map = generateMap(seed);
       expect([count(map, 'house'), count(map, 'shed'), count(map, 'car'), count(map, 'crate'), count(map, 'lowWall')])
-        .toEqual([1, 1, 2, 4, 1]);
+        .toEqual([4, 4, 8, 16, 4]);
     }
   });
 
-  it('gives the house 2 doorways on different sides and the shed 1 doorway', () => {
+  it('gives each house 2 doorways on different sides and each shed 1 doorway', () => {
     for (const seed of SEEDS) {
       const map = generateMap(seed);
-      const house = map.pieces.find((p) => p.kind === 'house');
-      const shed = map.pieces.find((p) => p.kind === 'shed');
-      expect(house.doorways).toHaveLength(2);
-      expect(side(house, house.doorways[0])).not.toBe(side(house, house.doorways[1]));
-      expect(shed.doorways).toHaveLength(1);
+      for (const house of map.pieces.filter((p) => p.kind === 'house')) {
+        expect(house.doorways).toHaveLength(2);
+        expect(side(house, house.doorways[0])).not.toBe(side(house, house.doorways[1]));
+      }
+      for (const shed of map.pieces.filter((p) => p.kind === 'shed')) expect(shed.doorways).toHaveLength(1);
+    }
+  });
+
+  it('gives every obstacle the height of what it is part of', () => {
+    const heights = { house: 96, shed: 96, car: 56, lowWall: 36, crate: 40 };
+    for (const seed of SEEDS.slice(0, 10)) {
+      const map = generateMap(seed);
+      for (const o of map.obstacles) {
+        const owner = map.pieces.find((p) => o.x >= p.x && o.y >= p.y && o.x + o.w <= p.x + p.w && o.y + o.h <= p.y + p.h);
+        expect(o.height).toBe(heights[owner.kind]);
+      }
     }
   });
 
@@ -95,8 +108,8 @@ describe('generateMap', () => {
       for (const piece of pieces) {
         expect(piece.x).toBeGreaterThanOrEqual(40);
         expect(piece.y).toBeGreaterThanOrEqual(40);
-        expect(piece.x + piece.w).toBeLessThanOrEqual(760);
-        expect(piece.y + piece.h).toBeLessThanOrEqual(560);
+        expect(piece.x + piece.w).toBeLessThanOrEqual(ARENA.width - 40);
+        expect(piece.y + piece.h).toBeLessThanOrEqual(ARENA.height - 40);
         expect(distanceToCentre(piece)).toBeGreaterThanOrEqual(100);
         for (const other of pieces) {
           if (other !== piece) expect(overlaps(grow(piece, 40), other)).toBe(false);

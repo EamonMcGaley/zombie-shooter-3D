@@ -8,6 +8,7 @@
     "test:watch": "vitest"
   },
   "devDependencies": {
+    "three": "^0.170.0",
     "vite": "^6.4.4",
     "vitest": "^3.2.7"
   }

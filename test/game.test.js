@@ -1,12 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import { createGame, step, zombiesInRound, zombieSpeedForRound, spawnIntervalForRound } from '../src/game.js';
-import { generateMap } from '../src/map.js';
+import { generateMap, ARENA } from '../src/map.js';
 
 const STEP = 1 / 60;
 
-// A game in an empty arena (no buildings), so older tests aren't affected by random maps.
+// A game in an empty arena (no buildings), so tests aren't affected by random maps.
+// The player starts at (400, 300), near the top-left corner of the arena, so tests
+// can use small, easy numbers.
 function emptyGame(options = {}) {
-  return createGame({ obstacles: [], ...options });
+  const game = createGame({ obstacles: [], ...options });
+  game.player.x = 400;
+  game.player.y = 300;
+  return game;
 }
 
 function input(overrides = {}) {
@@ -22,11 +27,11 @@ function run(game, inp, seconds) {
 
 describe('new game', () => {
   it('starts in a ROUND 1 pause with the player in the centre and no zombies', () => {
-    const game = emptyGame();
+    const game = createGame({ obstacles: [] });
     expect(game.round).toBe(1);
     expect(game.phase).toBe('roundBreak');
-    expect(game.player.x).toBe(400);
-    expect(game.player.y).toBe(300);
+    expect(game.player.x).toBe(ARENA.width / 2);
+    expect(game.player.y).toBe(ARENA.height / 2);
     expect(game.zombies).toEqual([]);
   });
 });
@@ -63,9 +68,12 @@ describe('movement', () => {
   });
 
   it('stops the player at the bottom-right edges', () => {
-    const game = run(emptyGame(), input({ right: true, down: true }), 2.9);
-    expect(game.player.x).toBe(788);
-    expect(game.player.y).toBe(588);
+    const game = emptyGame();
+    game.player.x = ARENA.width - 400;
+    game.player.y = ARENA.height - 300;
+    const after = run(game, input({ right: true, down: true }), 2.9);
+    expect(after.player.x).toBe(ARENA.width - 12);
+    expect(after.player.y).toBe(ARENA.height - 12);
   });
 });
 
@@ -92,7 +100,7 @@ describe('shooting', () => {
 
   it('removes bullets that leave the arena', () => {
     let game = step(emptyGame(), input({ ...aimRight, firing: true }), STEP);
-    game = run(game, input(aimRight), 2);
+    game = run(game, input(aimRight), 3.5);
     expect(game.bullets).toEqual([]);
   });
 });
@@ -159,23 +167,60 @@ describe('zombies', () => {
     expect(game.zombies.length).toBeGreaterThan(0);
   });
 
-  it('spawns zombies outside the arena, at least 250 px from the player', () => {
-    for (let seed = 1; seed <= 20; seed++) {
-      // Player hides in the top-left corner, the worst case for fair spawns.
-      let game = run(emptyGame({ random: seededRandom(seed) }), input({ left: true, up: true }), 3.05);
+  // Steps a game for `seconds`, recording where each zombie was when it first appeared.
+  function spawnSpots(game, inp, seconds) {
+    const spots = [];
+    const seen = new Set();
+    for (let t = 0; t < seconds && game.phase !== 'gameOver'; t += STEP) {
+      game = step(game, inp, STEP);
       for (const z of game.zombies) {
-        const outside = z.x < 0 || z.x > 800 || z.y < 0 || z.y > 600;
-        expect(outside).toBe(true);
-        expect(Math.hypot(z.x - game.player.x, z.y - game.player.y)).toBeGreaterThanOrEqual(250);
+        if (seen.has(z)) continue;
+        seen.add(z);
+        spots.push({ x: z.x, y: z.y, distance: Math.hypot(z.x - game.player.x, z.y - game.player.y), game });
       }
-      expect(game.zombies.length).toBeGreaterThan(0);
+    }
+    return spots;
+  }
+
+  it('spawns zombies inside the arena, never within 10 tiles (200 px) of the player', () => {
+    for (let seed = 1; seed <= 20; seed++) {
+      // Player hides in the top-left corner.
+      const spots = spawnSpots(emptyGame({ random: seededRandom(seed) }), input({ left: true, up: true }), 3.5);
+      expect(spots.length).toBeGreaterThan(0);
+      for (const spot of spots) {
+        expect(spot.x).toBeGreaterThanOrEqual(0);
+        expect(spot.x).toBeLessThanOrEqual(ARENA.width);
+        expect(spot.y).toBeGreaterThanOrEqual(0);
+        expect(spot.y).toBeLessThanOrEqual(ARENA.height);
+        expect(spot.distance).toBeGreaterThanOrEqual(200 - 5); // it may already have taken one step
+      }
+    }
+  });
+
+  it('spawns zombies all over the map, not just at the edges', () => {
+    let deepInside = 0;
+    for (let seed = 1; seed <= 20; seed++) {
+      for (const spot of spawnSpots(emptyGame({ random: seededRandom(seed) }), input(), 7)) {
+        const fromEdge = Math.min(spot.x, spot.y, ARENA.width - spot.x, ARENA.height - spot.y);
+        if (fromEdge > 200) deepInside++;
+      }
+    }
+    expect(deepInside).toBeGreaterThan(10);
+  });
+
+  it('never spawns zombies inside walls or objects', () => {
+    for (let seed = 1; seed <= 10; seed++) {
+      const game = createGame({ seed, random: seededRandom(seed) });
+      for (const spot of spawnSpots(game, input(), 8)) {
+        for (const wall of spot.game.obstacles) expect(overlapDepth({ ...spot, r: 12 }, wall)).toBeLessThan(0.01);
+      }
     }
   });
 
   it('still spawns fairly if the random numbers are unlucky', () => {
     const game = run(emptyGame({ random: () => 0 }), input({ left: true, up: true }), 3.05);
     const z = game.zombies[0];
-    expect(Math.hypot(z.x - game.player.x, z.y - game.player.y)).toBeGreaterThanOrEqual(250);
+    expect(Math.hypot(z.x - game.player.x, z.y - game.player.y)).toBeGreaterThanOrEqual(200);
   });
 
   it('walks towards the player at the round speed', () => {
@@ -335,6 +380,51 @@ describe('obstacles', () => {
       { x: 460, y: 320, w: 20, h: 40 }, // right, below the doorway
     ];
     const game = runUntilCaught(playingGame([[100, 300]], room), 12);
+    expect(game.phase).toBe('gameOver');
+  });
+});
+
+describe('jumping', () => {
+  const crate = { x: 460, y: 280, w: 40, h: 40, height: 40 };
+  const car = { x: 460, y: 280, w: 40, h: 40, height: 56 };
+
+  it('goes up and comes back down', () => {
+    let game = step(emptyGame(), input({ jump: true }), STEP);
+    game = run(game, input(), 0.2);
+    expect(game.player.z).toBeGreaterThan(30);
+    game = run(game, input(), 1);
+    expect(game.player.z).toBe(0);
+  });
+
+  it('cannot jump again until landing', () => {
+    let game = emptyGame();
+    let highest = 0;
+    for (let i = 0; i < 90; i++) {
+      game = step(game, input({ jump: true }), STEP);
+      highest = Math.max(highest, game.player.z);
+    }
+    expect(highest).toBeLessThan(62);
+  });
+
+  it('is stopped by a crate when not jumping', () => {
+    const game = run(emptyGame({ obstacles: [crate] }), input({ right: true }), 1);
+    expect(game.player.x).toBeCloseTo(448);
+  });
+
+  it('clears a crate while running', () => {
+    let game = step(emptyGame({ obstacles: [crate] }), input({ right: true, jump: true }), STEP);
+    game = run(game, input({ right: true }), 1);
+    expect(game.player.x).toBeGreaterThan(512);
+  });
+
+  it('cannot clear a car', () => {
+    let game = step(emptyGame({ obstacles: [car] }), input({ right: true, jump: true }), STEP);
+    game = run(game, input({ right: true }), 1);
+    expect(game.player.x).toBeCloseTo(448);
+  });
+
+  it('still gets caught by a zombie mid-air', () => {
+    const game = step(playingGame([[420, 300]]), input({ jump: true }), STEP);
     expect(game.phase).toBe('gameOver');
   });
 });

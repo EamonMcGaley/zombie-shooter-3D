@@ -1,9 +1,10 @@
 // Game rules for Zombie Arena. No browser code in here, so it can be tested.
 // See .scratch/arena-shooter/spec.md for the rules this implements.
 
-import { generateMap, blockedTiles, distancesFrom, TILE, COLS, ROWS } from './map.js';
+import { generateMap, blockedTiles, distancesFrom, TILE, COLS, ROWS, ARENA } from './map.js';
+import { lineEntry, grow } from './geometry.js';
 
-export const ARENA = { width: 800, height: 600 };
+export { ARENA };
 export const PLAYER_SPEED = 200;
 export const PLAYER_RADIUS = 12;
 export const ROUND_BREAK = 3;
@@ -11,7 +12,9 @@ export const FIRE_RATE = 5;
 export const BULLET_SPEED = 500;
 export const BULLET_RADIUS = 3;
 export const ZOMBIE_RADIUS = 12;
-const MIN_SPAWN_DISTANCE = 250;
+export const JUMP_SPEED = 330; // upward speed at the start of a jump
+export const GRAVITY = 900;
+const MIN_SPAWN_DISTANCE = 10 * TILE; // zombies never appear within 10 tiles of you
 const AIM_ASSIST_CONE = (30 * Math.PI) / 180;
 
 // --- Round rules ---
@@ -48,7 +51,7 @@ export function createGame({ random = Math.random, seed, obstacles } = {}) {
     round: 1,
     phase: 'roundBreak', // 'roundBreak' | 'playing' | 'gameOver'
     breakTimer: ROUND_BREAK,
-    player: { x: ARENA.width / 2, y: ARENA.height / 2, r: PLAYER_RADIUS },
+    player: { x: ARENA.width / 2, y: ARENA.height / 2, r: PLAYER_RADIUS, z: 0, vz: 0 }, // z: height off the ground
     zombies: [],
     zombiesToSpawn: 0,
     spawnTimer: 0,
@@ -61,7 +64,8 @@ export function step(game, input, dt) {
   if (game.phase === 'gameOver') return game;
 
   movePlayer(game.player, input, dt);
-  pushOutOfObstacles(game.player, game.obstacles);
+  jump(game.player, input, dt);
+  pushOutOfObstacles(game.player, game.obstacles, game.player.z);
   fire(game, input, dt);
   moveBullets(game, dt);
 
@@ -110,6 +114,15 @@ function movePlayer(player, input, dt) {
   }
   player.x = clamp(player.x, player.r, ARENA.width - player.r);
   player.y = clamp(player.y, player.r, ARENA.height - player.r);
+}
+
+// Starts a jump only from the ground (no double jumps), then lets gravity pull you back down.
+function jump(player, input, dt) {
+  if (input.jump && player.z === 0) player.vz = JUMP_SPEED;
+  if (player.z === 0 && player.vz <= 0) return;
+  player.vz -= GRAVITY * dt;
+  player.z = Math.max(0, player.z + player.vz * dt);
+  if (player.z === 0) player.vz = 0;
 }
 
 // --- Bullets ---
@@ -176,31 +189,28 @@ function shootZombies(game) {
 function spawnZombies(game, dt) {
   game.spawnTimer -= dt;
   if (game.zombiesToSpawn === 0 || game.spawnTimer > 1e-9) return;
-  game.zombies.push({ ...spawnPoint(game), r: ZOMBIE_RADIUS });
+  const zombie = { ...spawnPoint(game), r: ZOMBIE_RADIUS };
+  pushOutOfObstacles(zombie, game.obstacles); // a zombie is wider than a tile, so it may poke into a wall
+  game.zombies.push(zombie);
   game.zombiesToSpawn -= 1;
   game.spawnTimer = spawnIntervalForRound(game.round);
 }
 
-// A random point just outside the arena edge, far enough from the player to be fair.
+// The centre of a random open tile anywhere on the map, at least 10 tiles from the player.
 function spawnPoint(game) {
-  const { random, player } = game;
-  const { width, height } = ARENA;
-  const r = ZOMBIE_RADIUS;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const edge = Math.floor(random() * 4);
-    const t = random();
-    const point = [
-      { x: t * width, y: -r },
-      { x: t * width, y: height + r },
-      { x: -r, y: t * height },
-      { x: width + r, y: t * height },
-    ][edge];
+  const { random, player, blocked } = game;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const c = Math.floor(random() * COLS);
+    const r = Math.floor(random() * ROWS);
+    if (blocked[r * COLS + c]) continue;
+    const point = { x: (c + 0.5) * TILE, y: (r + 0.5) * TILE };
     if (distance(point, player) >= MIN_SPAWN_DISTANCE) return point;
   }
-  // Unlucky random numbers: use the corner furthest from the player.
+  // Unlucky random numbers: use the corner tile furthest from the player (the
+  // map always keeps the edges open).
   return {
-    x: player.x < width / 2 ? width + r : -r,
-    y: player.y < height / 2 ? height + r : -r,
+    x: player.x < ARENA.width / 2 ? ARENA.width - TILE / 2 : TILE / 2,
+    y: player.y < ARENA.height / 2 ? ARENA.height - TILE / 2 : TILE / 2,
   };
 }
 
@@ -259,25 +269,7 @@ function clearLine(from, to, obstacles) {
 }
 
 function lineHitsRect(a, b, rect) {
-  // Slab method: find where the line enters and leaves the rectangle's x and y ranges.
-  let enter = 0;
-  let leave = 1;
-  for (const [start, delta, min, max] of [
-    [a.x, b.x - a.x, rect.x, rect.x + rect.w],
-    [a.y, b.y - a.y, rect.y, rect.y + rect.h],
-  ]) {
-    if (delta === 0) {
-      if (start <= min || start >= max) return false;
-      continue;
-    }
-    let t1 = (min - start) / delta;
-    let t2 = (max - start) / delta;
-    if (t1 > t2) [t1, t2] = [t2, t1];
-    enter = Math.max(enter, t1);
-    leave = Math.min(leave, t2);
-    if (enter >= leave) return false;
-  }
-  return true;
+  return lineEntry(a, b, rect) !== null;
 }
 
 function pushZombiesApart(zombies) {
@@ -303,9 +295,12 @@ function pushZombiesApart(zombies) {
 
 // Moves a circle the shortest way out of any obstacle it overlaps. Pushing
 // straight out from the nearest edge is what lets things slide along walls.
-function pushOutOfObstacles(circle, obstacles) {
+// Obstacles lower than `height` (how high the circle is off the ground) are
+// jumped over. Obstacles with no height count as infinitely tall.
+function pushOutOfObstacles(circle, obstacles, height = 0) {
   for (let pass = 0; pass < 2; pass++) {
     for (const o of obstacles) {
+      if ((o.height ?? Infinity) <= height) continue;
       const depth = overlapDepth(circle, o);
       if (depth === 0) continue;
       const nearestX = clamp(circle.x, o.x, o.x + o.w);
@@ -337,10 +332,6 @@ function overlapDepth(circle, rect) {
   const nearestX = clamp(circle.x, rect.x, rect.x + rect.w);
   const nearestY = clamp(circle.y, rect.y, rect.y + rect.h);
   return Math.max(0, circle.r - Math.hypot(circle.x - nearestX, circle.y - nearestY));
-}
-
-function grow(rect, by) {
-  return { x: rect.x - by, y: rect.y - by, w: rect.w + 2 * by, h: rect.h + 2 * by };
 }
 
 // --- Helpers ---

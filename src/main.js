@@ -1,19 +1,26 @@
-// Browser layer: reads keyboard and mouse, runs the game loop, draws the game.
-// All the rules live in game.js.
+// Browser layer: reads keyboard, mouse and controller, runs the game loop, and
+// draws the game in 3D (third person) or top-down. All the rules live in game.js.
 
 import { createGame, step, ARENA } from './game.js';
 import { readGamepad } from './gamepad.js';
+import { moveFromInput, cameraPosition, aimPoint } from './camera.js';
+import { createView3D } from './view3d.js';
 
 const STEP = 1 / 60;
 const MAX_CATCH_UP = 0.25;
 const BEST_KEY = 'zombie-arena-best-round';
 const CONTROLLER_AIM_ASSIST = 0.05; // 5%: turn this up if aim assist feels too weak
+const MOUSE_TURN = 0.0025; // radians per pixel of mouse movement
+const STICK_TURN = 3; // radians per second with the right stick fully pushed
 
-const canvas = document.getElementById('game');
+const stage = document.getElementById('stage');
+const canvas = document.getElementById('game'); // top-down view, or the HUD over the 3D view
 const ctx = canvas.getContext('2d');
+const SCREEN = { width: canvas.width, height: canvas.height }; // HUD coordinates (the map is bigger)
+const view3d = createView3D(document.getElementById('view3d'));
 
 const input = { up: false, down: false, left: false, right: false, mouseX: 0, mouseY: 0, firing: false };
-const keyMap = { KeyW: 'up', KeyS: 'down', KeyA: 'left', KeyD: 'right' };
+const keyMap = { KeyW: 'up', KeyS: 'down', KeyA: 'left', KeyD: 'right', Space: 'jumpKey' };
 
 // A map seed in the address (?seed=123) replays that map; otherwise every game gets a new one.
 const urlSeed = Number.parseInt(new URLSearchParams(location.search).get('seed'), 10);
@@ -21,29 +28,75 @@ const newGame = () => createGame({ seed: Number.isNaN(urlSeed) ? undefined : url
 
 let game = newGame();
 let best = loadBest();
+let view = '3d'; // '3d' (third person) or '2d' (top-down)
+let yaw = 0; // which way you face in 3D: 0 is +x on the map
+let camera = cameraPosition(game.player, yaw, []);
+
+// --- Views ---
+
+function setView(next) {
+  view = next;
+  stage.classList.toggle('top-down', view === '2d');
+  if (view === '2d' && document.pointerLockElement) document.exitPointerLock();
+}
+setView('3d');
+
+function fitToWindow() {
+  const rect = stage.getBoundingClientRect();
+  view3d.resize(rect.width, rect.height);
+}
+window.addEventListener('resize', fitToWindow);
+fitToWindow();
+
+// Building walls block the camera; crates, cars and the low wall are below it.
+let tallWallsFor = null;
+let tallWalls = [];
+function buildingWalls() {
+  if (tallWallsFor !== game.obstacles) {
+    const buildings = game.pieces.filter((p) => p.doorways);
+    const inside = (p, r) => r.x >= p.x && r.y >= p.y && r.x + r.w <= p.x + p.w && r.y + r.h <= p.y + p.h;
+    tallWalls = game.obstacles.filter((o) => game.pieces.length === 0 || buildings.some((b) => inside(b, o)));
+    tallWallsFor = game.obstacles;
+  }
+  return tallWalls;
+}
 
 // --- Input: keyboard and mouse ---
 
 const mouse = { x: 0, y: 0, firing: false };
 let aimWith = 'mouse'; // whichever was used last: 'mouse' or 'controller'
-let controllerAim = { x: 1, y: 0 }; // last right-stick direction
+let controllerAim = { x: 1, y: 0 }; // last right-stick direction (top-down view)
+let viewButtonWasDown = false;
+const mouseCaptured = () => document.pointerLockElement === canvas;
 
 window.addEventListener('keydown', (e) => {
   if (keyMap[e.code]) input[keyMap[e.code]] = true;
+  if (e.code === 'Space') e.preventDefault();
   if (e.code === 'KeyR' && game.phase === 'gameOver') game = newGame();
+  if (e.code === 'KeyV' && !e.repeat) setView(view === '3d' ? '2d' : '3d');
 });
 window.addEventListener('keyup', (e) => {
   if (keyMap[e.code]) input[keyMap[e.code]] = false;
 });
 canvas.addEventListener('mousemove', (e) => {
-  // The canvas may be drawn smaller than 800x600, so scale back to game units.
-  const rect = canvas.getBoundingClientRect();
-  mouse.x = ((e.clientX - rect.left) / rect.width) * ARENA.width;
-  mouse.y = ((e.clientY - rect.top) / rect.height) * ARENA.height;
+  if (view === '3d') {
+    if (!mouseCaptured()) return;
+    yaw += e.movementX * MOUSE_TURN;
+  } else {
+    // The canvas may be drawn smaller or bigger than 800x600, so scale back to game units.
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = ((e.clientX - rect.left) / rect.width) * ARENA.width;
+    mouse.y = ((e.clientY - rect.top) / rect.height) * ARENA.height;
+  }
   aimWith = 'mouse';
 });
 canvas.addEventListener('mousedown', (e) => {
-  if (e.button === 0) mouse.firing = true;
+  if (e.button !== 0) return;
+  if (view === '3d' && !mouseCaptured()) {
+    canvas.requestPointerLock(); // the first click captures the mouse instead of firing
+    return;
+  }
+  mouse.firing = true;
 });
 window.addEventListener('mouseup', (e) => {
   if (e.button === 0) mouse.firing = false;
@@ -53,36 +106,51 @@ window.addEventListener('blur', () => {
   mouse.firing = false;
 });
 
-// --- Input: controller, read fresh every frame and combined with keyboard and mouse ---
+// --- Input: combined every frame into what the rules understand ---
 
-function readInput() {
-  let moveX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
-  let moveY = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+function readInput(dt) {
+  const keyX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  const keyY = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  let stick = { x: 0, y: 0 };
   let controllerFiring = false;
+  let controllerJump = false;
 
   const pad = [...(navigator.getGamepads?.() ?? [])].find(Boolean);
   if (pad) {
     const controller = readGamepad(pad);
     if (controller.active) aimWith = 'controller';
-    moveX += controller.move.x;
-    moveY += controller.move.y;
+    stick = controller.move;
     if (controller.aim) controllerAim = controller.aim;
+    if (view === '3d') yaw += controller.look.x * STICK_TURN * dt;
     controllerFiring = controller.firing;
+    controllerJump = controller.jump;
     if (controller.restart && game.phase === 'gameOver') game = newGame();
+    if (controller.switchView && !viewButtonWasDown) setView(view === '3d' ? '2d' : '3d');
+    viewButtonWasDown = controller.switchView;
   }
 
-  input.moveX = moveX;
-  input.moveY = moveY;
   input.firing = mouse.firing || controllerFiring;
-  if (aimWith === 'controller') {
-    // The rules aim at a point, so aim 100 px out in the stick's direction.
-    input.mouseX = game.player.x + controllerAim.x * 100;
-    input.mouseY = game.player.y + controllerAim.y * 100;
-    input.aimAssist = CONTROLLER_AIM_ASSIST;
+  input.jump = input.jumpKey || controllerJump;
+  input.aimAssist = aimWith === 'controller' ? CONTROLLER_AIM_ASSIST : 0;
+
+  if (view === '3d') {
+    // Forward is wherever you're facing; the rules aim at a point out past the crosshair.
+    Object.assign(input, moveFromInput(-keyY - stick.y, keyX + stick.x, yaw));
+    camera = cameraPosition(game.player, yaw, buildingWalls());
+    const target = aimPoint(camera, yaw);
+    input.mouseX = target.x;
+    input.mouseY = target.y;
   } else {
-    input.mouseX = mouse.x;
-    input.mouseY = mouse.y;
-    input.aimAssist = 0;
+    input.moveX = keyX + stick.x;
+    input.moveY = keyY + stick.y;
+    if (aimWith === 'controller') {
+      // The rules aim at a point, so aim 100 px out in the stick's direction.
+      input.mouseX = game.player.x + controllerAim.x * 100;
+      input.mouseY = game.player.y + controllerAim.y * 100;
+    } else {
+      input.mouseX = mouse.x;
+      input.mouseY = mouse.y;
+    }
   }
 }
 
@@ -110,13 +178,15 @@ let last = performance.now();
 let leftover = 0;
 
 function frame(now) {
-  leftover += Math.min((now - last) / 1000, MAX_CATCH_UP);
+  const dt = Math.min((now - last) / 1000, MAX_CATCH_UP);
+  leftover += dt;
   last = now;
-  readInput();
+  readInput(dt);
   while (leftover >= STEP) {
     game = step(game, input, STEP);
     leftover -= STEP;
   }
+  camera = cameraPosition(game.player, yaw, buildingWalls());
   if (game.phase === 'gameOver' && game.round > best) {
     best = game.round;
     saveBest(best);
@@ -151,6 +221,7 @@ function drawPlayer(player) {
   const facing = Math.atan2(input.mouseY - player.y, input.mouseX - player.x);
   ctx.save();
   ctx.translate(player.x, player.y);
+  ctx.scale(1 + player.z / 120, 1 + player.z / 120); // look bigger (closer) while jumping
   ellipse(1, 2, 13, 13, 'rgba(0, 0, 0, 0.35)'); // shadow
   ctx.rotate(facing);
 
@@ -295,39 +366,69 @@ function centredText(text, y, size, colour) {
   ctx.fillStyle = colour;
   ctx.font = `bold ${size}px system-ui, sans-serif`;
   ctx.textAlign = 'center';
-  ctx.fillText(text, ARENA.width / 2, y);
+  ctx.fillText(text, SCREEN.width / 2, y);
 }
 
 function draw() {
-  ctx.clearRect(0, 0, ARENA.width, ARENA.height);
+  ctx.clearRect(0, 0, SCREEN.width, SCREEN.height);
 
-  drawMap();
-  for (const bullet of game.bullets) drawBullet(bullet);
-  for (const zombie of game.zombies) drawZombie(zombie);
-  drawPlayer(game.player);
+  if (view === '3d') {
+    view3d.render(game, { yaw, camera });
+    drawCrosshair();
+    if (!mouseCaptured() && aimWith === 'mouse' && game.phase !== 'gameOver') {
+      centredText('Click to look around with the mouse (Esc to let go)', SCREEN.height - 60, 18, '#eee');
+    }
+  } else {
+    // Shrink the whole map to fit the screen.
+    ctx.save();
+    ctx.scale(SCREEN.width / ARENA.width, SCREEN.height / ARENA.height);
+    drawMap();
+    for (const bullet of game.bullets) drawBullet(bullet);
+    for (const zombie of game.zombies) drawZombie(zombie);
+    drawPlayer(game.player);
+    ctx.restore();
+  }
+  drawHud();
+}
 
-  // HUD
+function drawCrosshair() {
+  const cx = SCREEN.width / 2;
+  const cy = SCREEN.height / 2;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    ctx.moveTo(cx + dx * 4, cy + dy * 4);
+    ctx.lineTo(cx + dx * 11, cy + dy * 11);
+  }
+  ctx.stroke();
+}
+
+function drawHud() {
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+  ctx.shadowBlur = 4;
   ctx.fillStyle = '#ddd';
   ctx.font = '16px system-ui, sans-serif';
   ctx.textAlign = 'left';
   ctx.fillText(`Round ${game.round}`, 12, 24);
   ctx.fillText(`Zombies left: ${game.zombiesToSpawn + game.zombies.length}`, 12, 46);
   ctx.textAlign = 'right';
-  ctx.fillText(`Best: ${Math.max(best, game.round)}`, ARENA.width - 12, 24);
+  ctx.fillText(`Best: ${Math.max(best, game.round)}`, SCREEN.width - 12, 24);
   if (game.seed !== null) {
     ctx.fillStyle = '#888';
     ctx.font = '13px system-ui, sans-serif';
-    ctx.fillText(`Map seed: ${game.seed}`, ARENA.width - 12, ARENA.height - 12);
+    ctx.fillText(`Map seed: ${game.seed}`, SCREEN.width - 12, SCREEN.height - 12);
   }
 
   if (game.phase === 'roundBreak') {
-    centredText(`ROUND ${game.round}`, ARENA.height / 2, 72, '#b5001b');
+    centredText(`ROUND ${game.round}`, SCREEN.height / 2, 72, '#b5001b');
   }
   if (game.phase === 'gameOver') {
     ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-    ctx.fillRect(0, 0, ARENA.width, ARENA.height);
-    centredText('GAME OVER', ARENA.height / 2 - 30, 64, '#e5383b');
-    centredText(`You reached round ${game.round}`, ARENA.height / 2 + 20, 24, '#ddd');
-    centredText('Press R to restart', ARENA.height / 2 + 60, 20, '#aaa');
+    ctx.fillRect(0, 0, SCREEN.width, SCREEN.height);
+    centredText('GAME OVER', SCREEN.height / 2 - 30, 64, '#e5383b');
+    centredText(`You reached round ${game.round}`, SCREEN.height / 2 + 20, 24, '#ddd');
+    centredText('Press R (or A / ✕) to restart', SCREEN.height / 2 + 60, 20, '#aaa');
   }
+  ctx.shadowBlur = 0;
 }

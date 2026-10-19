@@ -7,6 +7,7 @@ export const DEADZONE = 0.2;
 // Standard controller layout (same positions on Xbox and PlayStation pads).
 const BUTTON_A = 0; // A / cross
 const BUTTON_RT = 7; // RT / R2
+const BUTTON_VIEW = 8; // View / Share
 const BUTTON_START = 9; // Start / Options
 
 export function readGamepad(pad) {
@@ -19,8 +20,11 @@ export function readGamepad(pad) {
   return {
     move,
     aim,
+    look: right,
     firing: button(BUTTON_RT).value > 0.5,
     restart: button(BUTTON_A).pressed || button(BUTTON_START).pressed,
+    switchView: button(BUTTON_VIEW).pressed,
+    jump: button(BUTTON_A).pressed,
     active: aim !== null || move.x !== 0 || move.y !== 0 || pad.buttons.some((b) => b.pressed),
   };
 }

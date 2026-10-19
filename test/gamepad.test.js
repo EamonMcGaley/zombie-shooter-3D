@@ -44,6 +44,23 @@ describe('readGamepad', () => {
     expect(result.firing).toBe(false);
   });
 
+  it('reports how far the right stick is pushed, for turning', () => {
+    const result = readGamepad(pad({ right: [0.6, 0] }));
+    expect(result.look.x).toBeCloseTo(0.5);
+    expect(result.look.y).toBeCloseTo(0);
+    expect(readGamepad(pad()).look).toEqual({ x: 0, y: 0 });
+  });
+
+  it('jumps with A / cross', () => {
+    expect(readGamepad(pad({ pressed: [0] })).jump).toBe(true);
+    expect(readGamepad(pad()).jump).toBe(false);
+  });
+
+  it('switches view with View / Share', () => {
+    expect(readGamepad(pad({ pressed: [8] })).switchView).toBe(true);
+    expect(readGamepad(pad()).switchView).toBe(false);
+  });
+
   it('fires with RT / R2 pressed past halfway', () => {
     expect(readGamepad(pad({ rt: 0.9 })).firing).toBe(true);
     expect(readGamepad(pad({ rt: 0.3 })).firing).toBe(false);
